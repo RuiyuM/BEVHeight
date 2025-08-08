@@ -2,6 +2,7 @@
 from argparse import ArgumentParser, Namespace
 
 import os
+os.chdir("/people/cs/r/rxm210041/Desktop/test_3d_active/BEVHeight")
 import mmcv
 import pytorch_lightning as pl
 import torch
@@ -26,8 +27,8 @@ img_conf = dict(img_mean=[123.675, 116.28, 103.53],
                 img_std=[58.395, 57.12, 57.375],
                 to_rgb=True)
 
-data_root = "data/dair-v2x-i/"
-gt_label_path = "data/dair-v2x-i-kitti/training/label_2"
+data_root = "/data/rxm210041/dair-v2x-i/"
+gt_label_path = "/data/rxm210041/dair-v2x-i-kitti/training/label_2"
 
 backbone_conf = {
     'x_bound': [0, 102.4, 0.8],
