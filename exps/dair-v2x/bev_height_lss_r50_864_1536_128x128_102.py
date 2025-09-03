@@ -1,7 +1,15 @@
 # Copyright (c) Megvii Inc. All rights reserved.
 from argparse import ArgumentParser, Namespace
 
-import os
+import sys, os
+BEVHEIGHT_ROOT = "/people/cs/r/rxm210041/Desktop/test_3d_active/BEVHeight"
+if BEVHEIGHT_ROOT not in sys.path:
+    sys.path.insert(0, BEVHEIGHT_ROOT)
+
+# （可选）防串包自检
+import evaluators.det_evaluators as _det
+print("Using RoadSideEvaluator from:", _det.__file__)
+assert "BEVHeight/evaluators" in _det.__file__, f"Wrong evaluator: {_det.__file__}"
 os.chdir("/people/cs/r/rxm210041/Desktop/test_3d_active/BEVHeight")
 import mmcv
 import pytorch_lightning as pl
@@ -22,7 +30,7 @@ from utils.backup_files import backup_codebase
 
 H = 1080
 W = 1920
-final_dim = (864, 1536)
+final_dim = (512, 512)
 img_conf = dict(img_mean=[123.675, 116.28, 103.53],
                 img_std=[58.395, 57.12, 57.375],
                 to_rgb=True)
@@ -369,14 +377,40 @@ def main(args: Namespace) -> None:
     print(args)
     
     model = BEVHeightLightningModel(**vars(args))
-    checkpoint_callback = ModelCheckpoint(dirpath='./outputs/bev_height_lss_r50_864_1536_128x128/checkpoints', filename='{epoch}', every_n_epochs=5, save_last=True, save_top_k=-1)
+    checkpoint_callback = ModelCheckpoint(dirpath='/data/rxm210041/outputs/bev_height_lss_r50_864_1536_128x128/checkpoints', filename='{epoch}', every_n_epochs=5, save_last=True, save_top_k=-1)
     trainer = pl.Trainer.from_argparse_args(args, callbacks=[checkpoint_callback])
+    from pathlib import Path
+    import glob
+
     if args.evaluate:
-        for ckpt_name in os.listdir(args.ckpt_path):
-            model_pth = os.path.join(args.ckpt_path, ckpt_name)
-            trainer.test(model, ckpt_path=model_pth)
+        ckpt_arg = Path(args.ckpt_path)
+
+        def _test_one(path_str):
+            print(f"[Eval] {path_str}")
+            trainer.test(model, ckpt_path=path_str)
+
+        if ckpt_arg.is_file():
+            # ① 明确给了单个 ckpt 文件
+            _test_one(str(ckpt_arg))
+
+        elif ckpt_arg.is_dir():
+            # ② 给的是目录：只评测其中的 .ckpt
+            ckpts = sorted(ckpt_arg.glob("*.ckpt"))
+            if not ckpts:
+                raise FileNotFoundError(f"No .ckpt under {ckpt_arg}")
+            for ckpt in ckpts:
+                _test_one(str(ckpt))
+
+        else:
+            # ③ 既不是文件也不是目录，按通配符/模式处理
+            matches = sorted(glob.glob(args.ckpt_path))
+            if not matches:
+                raise FileNotFoundError(f"No match for pattern: {args.ckpt_path}")
+            for m in matches:
+                _test_one(m)
     else:
-        backup_codebase(os.path.join('./outputs/bev_height_lss_r50_864_1536_128x128', 'backup'))
+        backup_codebase(
+            os.path.join('/data/rxm210041/outputs/bev_height_lss_r50_864_1536_128x128_transformer', 'backup'))
         trainer.fit(model)
         
 def run_cli():
@@ -404,7 +438,7 @@ def run_cli():
         limit_val_batches=0,
         enable_checkpointing=True,
         precision=32,
-        default_root_dir='./outputs/bev_height_lss_r50_864_1536_128x128')
+        default_root_dir='/data/rxm210041/outputs/bev_height_lss_r50_864_1536_128x128')
     args = parser.parse_args()
     main(args)
 

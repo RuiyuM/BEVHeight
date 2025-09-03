@@ -23,7 +23,7 @@ from utils.backup_files import backup_codebase
 
 H = 1080
 W = 1920
-final_dim = (864, 1536)
+final_dim = (512, 512)
 img_conf = dict(img_mean=[123.675, 116.28, 103.53],
                 img_std=[58.395, 57.12, 57.375],
                 to_rgb=True)
@@ -214,6 +214,12 @@ class BEVHeightLightningModel(LightningModule):
                                            gt_label_path=gt_label_path,
                                            output_dir=self.default_root_dir)
         self.model = BEVHeight(self.backbone_conf, self.head_conf)
+        # 强制确保 ViT 可训练（防止别的地方误设）
+        for p in self.model.backbone.img_backbone.parameters():
+            p.requires_grad = True
+
+        print("ViT trainable params:",
+              sum(p.numel() for p in self.model.backbone.img_backbone.parameters() if p.requires_grad))
         self.mode = 'valid'
         self.img_conf = img_conf
         self.data_use_cbgs = False
@@ -303,13 +309,24 @@ class BEVHeightLightningModel(LightningModule):
             self.evaluator.evaluate(all_pred_results, all_img_metas)
 
     def configure_optimizers(self):
-        lr = self.basic_lr_per_img * \
-            self.batch_size_per_device * self.gpus
-        optimizer = torch.optim.AdamW(self.model.parameters(),
-                                      lr=lr,
-                                      weight_decay=1e-7)
-        scheduler = MultiStepLR(optimizer, [19, 23])
-        return [[optimizer], [scheduler]]
+        base_lr = self.basic_lr_per_img * self.batch_size_per_device * self.gpus
+        bb_lr = base_lr * 0.1  # backbone 小 10x 更稳，可按需 0.05~0.2
+
+        bb_params, other_params = [], []
+        for n, p in self.model.named_parameters():
+            if not p.requires_grad:
+                continue
+            if "backbone.img_backbone" in n:  # ← 你的 ViTBackbone 路径
+                bb_params.append(p)
+            else:
+                other_params.append(p)
+
+        opt = torch.optim.AdamW(
+            [{"params": other_params, "lr": base_lr, "weight_decay": 1e-7},
+             {"params": bb_params, "lr": bb_lr, "weight_decay": 1e-7}]
+        )
+        sch = MultiStepLR(opt, [19, 23])
+        return [[opt], [sch]]
 
     def train_dataloader(self):
         train_dataset = NuscMVDetDataset(
@@ -378,16 +395,42 @@ def main(args: Namespace) -> None:
     print(args)
     
     model = BEVHeightLightningModel(**vars(args))
-    checkpoint_callback = ModelCheckpoint(dirpath='./outputs/bev_height_lss_r50_864_1536_128x128_transformer/checkpoints', filename='{epoch}', every_n_epochs=5, save_last=True, save_top_k=-1)
+    checkpoint_callback = ModelCheckpoint(dirpath='/data/rxm210041/outputs/bev_height_lss_r50_864_1536_128x128_transformer/checkpoints', filename='{epoch}', every_n_epochs=5, save_last=True, save_top_k=-1)
     trainer = pl.Trainer.from_argparse_args(args, callbacks=[checkpoint_callback])
+    from pathlib import Path
+    import glob
+
     if args.evaluate:
-        for ckpt_name in os.listdir(args.ckpt_path):
-            model_pth = os.path.join(args.ckpt_path, ckpt_name)
-            trainer.test(model, ckpt_path=model_pth)
+        ckpt_arg = Path(args.ckpt_path)
+
+        def _test_one(path_str):
+            print(f"[Eval] {path_str}")
+            trainer.test(model, ckpt_path=path_str)
+
+        if ckpt_arg.is_file():
+            # ① 明确给了单个 ckpt 文件
+            _test_one(str(ckpt_arg))
+
+        elif ckpt_arg.is_dir():
+            # ② 给的是目录：只评测其中的 .ckpt
+            ckpts = sorted(ckpt_arg.glob("*.ckpt"))
+            if not ckpts:
+                raise FileNotFoundError(f"No .ckpt under {ckpt_arg}")
+            for ckpt in ckpts:
+                _test_one(str(ckpt))
+
+        else:
+            # ③ 既不是文件也不是目录，按通配符/模式处理
+            matches = sorted(glob.glob(args.ckpt_path))
+            if not matches:
+                raise FileNotFoundError(f"No match for pattern: {args.ckpt_path}")
+            for m in matches:
+                _test_one(m)
     else:
-        backup_codebase(os.path.join('./outputs/bev_height_lss_r50_864_1536_128x128_transformer', 'backup'))
+        backup_codebase(
+            os.path.join('/data/rxm210041/outputs/bev_height_lss_r50_864_1536_128x128_transformer', 'backup'))
         trainer.fit(model)
-        
+
 def run_cli():
     parent_parser = ArgumentParser(add_help=False)
     parent_parser = pl.Trainer.add_argparse_args(parent_parser)
@@ -413,7 +456,7 @@ def run_cli():
         limit_val_batches=0,
         enable_checkpointing=True,
         precision=32,
-        default_root_dir='./outputs/bev_height_lss_r50_864_1536_128x128_transformer')
+        default_root_dir='/data/rxm210041/outputs/bev_height_lss_r50_864_1536_128x128_transformer')
     args = parser.parse_args()
     main(args)
 

@@ -447,16 +447,62 @@ def main(args: Namespace) -> None:
     if args.seed is not None:
         pl.seed_everything(args.seed)
     print(args)
-    
+
+    def _test_one(ckpt_path: str):
+        print(f"[Eval] {ckpt_path}")
+
+        # 1) 先实例化同一份模型（确保构造参数与训练时一致）
+        model = BEVHeightLightningModel(**vars(args))
+
+        # 2) 读 ckpt（CPU 即可）
+        ckpt = torch.load(ckpt_path, map_location="cpu")
+        sd = ckpt["state_dict"]
+
+        # 3) 让 vggt backbone 先“按 ckpt 的形状”把 _proj 构建出来
+        #    这里根据你的模块层级拿到 wrapper 实例：
+        #    LightningModule.model -> BEVHeight -> backbone(LSSFPN) -> img_backbone(VGGTBackbone)
+        img_backbone = getattr(model.model.backbone, "img_backbone", None)
+        if img_backbone is not None and hasattr(img_backbone, "build_proj_from_state_dict"):
+            img_backbone.build_proj_from_state_dict(sd)
+        else:
+            print("[Warn] img_backbone 没有 build_proj_from_state_dict，可能不是 VGGTBackbone ？")
+
+        # 4) 严格加载（这一步就不会再报 Unexpected key）
+        missing, unexpected = model.load_state_dict(sd, strict=True)
+        # 按理说 missing/unexpected 都应为空；如果不为空，打印出来排查
+        if missing:
+            print("[StrictLoad][missing]:", missing)
+        if unexpected:
+            print("[StrictLoad][unexpected]:", unexpected)
+
+        # 5) 运行测试；注意此处不要再传 ckpt_path（我们已经手动加载过权重）
+        trainer.test(model, ckpt_path=None)
+
     model = BEVHeightLightningModel(**vars(args))
-    checkpoint_callback = ModelCheckpoint(dirpath='/data/rxm210041/outputs/bev_height_lss_r50_864_1536_128x128_transformer/checkpoints', filename='{epoch}', every_n_epochs=5, save_last=True, save_top_k=-1)
+    checkpoint_callback = ModelCheckpoint(dirpath='/data/rxm210041/outputs/bev_height_lss_r50_864_1536_128x128_vggt/checkpoints', filename='{epoch}', every_n_epochs=5, save_last=True, save_top_k=-1)
     trainer = pl.Trainer.from_argparse_args(args, callbacks=[checkpoint_callback])
+    from pathlib import Path
+    import glob
+
     if args.evaluate:
-        for ckpt_name in os.listdir(args.ckpt_path):
-            model_pth = os.path.join(args.ckpt_path, ckpt_name)
-            trainer.test(model, ckpt_path=model_pth)
+        p = Path(args.ckpt_path)
+        if p.is_file():
+            _test_one(str(p))
+        elif p.is_dir():
+            ckpts = sorted(p.glob("*.ckpt"))
+            if not ckpts:
+                raise FileNotFoundError(f"No .ckpt under {p}")
+            for c in ckpts:
+                _test_one(str(c))
+        else:
+            matches = sorted(glob.glob(args.ckpt_path))
+            if not matches:
+                raise FileNotFoundError(f"No match for pattern: {args.ckpt_path}")
+            for m in matches:
+                _test_one(m)
     else:
-        backup_codebase(os.path.join('/data/rxm210041/outputs/bev_height_lss_r50_864_1536_128x128_transformer', 'backup'))
+        backup_codebase(
+            os.path.join('/data/rxm210041/outputs/bev_height_lss_r50_864_1536_128x128_transformer', 'backup'))
         trainer.fit(model)
         
 def run_cli():
@@ -484,7 +530,7 @@ def run_cli():
         limit_val_batches=0,
         enable_checkpointing=True,
         precision=32,
-        default_root_dir='/data/rxm210041/outputs/bev_height_lss_r50_864_1536_128x128_transformer')
+        default_root_dir='/data/rxm210041/outputs/bev_height_lss_r50_864_1536_128x128_vggt')
     args = parser.parse_args()
     main(args)
 

@@ -3,6 +3,7 @@ import os, sys, math, importlib
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import re
 
 # ==== 导入 VGGT（按需设置你的本地源码路径）====
 FALLBACK_VGGT_SRC = "/people/cs/r/rxm210041/Desktop/test_3d_active/vggt"
@@ -114,6 +115,41 @@ class _VGGTCore(BaseModule):
 
     def init_weights(self):
         return
+
+    def build_proj_from_state_dict(self, state_dict):
+        """
+        根据 ckpt 里保存的 _proj.* 权重形状，预先构建 4 个 1x1 Conv，
+        这样 load_state_dict(strict=True) 不会报 Unexpected key。
+        """
+        # 可能的 key 前缀示例：
+        # "model.backbone.img_backbone._proj.0.weight"
+        # "img_backbone._proj.0.weight"
+        # 保险起见遍历一次：
+        proj0_key = None
+        for k in state_dict.keys():
+            # 只要结尾满足 _proj.0.weight 即可
+            if re.search(r"\b_proj\.0\.weight$", k):
+                proj0_key = k
+                break
+
+        if proj0_key is None:
+            # ckpt 本来就没有 _proj（比如你后来删了），那就跳过
+            print("[VGGTBackbone] No _proj.* in state_dict; skip building.")
+            return
+
+        W = state_dict[proj0_key]            # shape: [out_ch, in_ch, 1, 1]
+        if not isinstance(W, torch.Tensor) or W.ndim != 4:
+            print(f"[VGGTBackbone] Unexpected tensor for {proj0_key}: {type(W)} with ndim={getattr(W,'ndim',None)}")
+            return
+
+        out_ch, in_ch = int(W.shape[0]), int(W.shape[1])
+
+        # 真正构建 4 个 Conv（名字和层级要与训练时一致）
+        self._proj = nn.ModuleList([nn.Conv2d(in_ch, out_ch, kernel_size=1, bias=True) for _ in range(4)])
+        self._proj_ready = True
+
+        print(f"[VGGTBackbone] Built _proj with in_ch={in_ch}, out_ch={out_ch} (x4).")
+
 
     @torch.no_grad()
     def _ensure_proj(self, fmap_like: torch.Tensor):
