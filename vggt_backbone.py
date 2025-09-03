@@ -117,10 +117,20 @@ class _VGGTCore(BaseModule):
 
     @torch.no_grad()
     def _ensure_proj(self, fmap_like: torch.Tensor):
+        dev = fmap_like.device
+        dt = fmap_like.dtype
+
         if self._proj_ready:
+            # 如果早就建过，但设备/精度不一致，还是要搬一次
+            for m in self._proj:
+                m.to(device=dev, dtype=dt)
             return
+
         Ctok = fmap_like.shape[1]
         self._proj = nn.ModuleList([nn.Conv2d(Ctok, self.out_channels, 1) for _ in range(4)])
+        # ★ 新建后立刻搬到与输入相同的 device/dtype
+        for m in self._proj:
+            m.to(device=dev, dtype=dt)
         self._proj_ready = True
 
     def forward(self, x):
@@ -137,15 +147,31 @@ class _VGGTCore(BaseModule):
         w = math.ceil(Wpad / 14)
 
         # 2) aggregator 要 5D；你的 tokens_list 是 24 层
-        x5 = x_pad if x_pad.dim() == 5 else x_pad.unsqueeze(1)  # [B,1,3,Hpad,Wpad]
-        tokens_list, ps_idx_list = self.vggt.aggregator(x5)  # 每层通常是 [B,1,T,C]
+        x5 = x_pad if x_pad.dim() == 5 else x_pad.unsqueeze(1)
+        with torch.no_grad():
+            tokens_list, ps_idx_raw = self.vggt.aggregator(x5)
 
-        # 工具：压掉序列维 S
-        def squeeze_seq(t):
-            return t[:, 0] if t.dim() == 4 else t  # [B,T,C] / [B,T] / [B,T,2]
+        # 工具：仅在是张量时才“去掉序列维”，否则原样返回
+        def squeeze_seq_tensor(t):
+            if torch.is_tensor(t):
+                return t[:, 0] if t.dim() == 4 else t  # [B,T,C] / [B,T] / [B,T,2]
+            return t
+
+        # 统一“拿第 i 层的 ps_idx”：若不是张量（如 int/None），返回 None 走 fallback
+        def pick_ps_idx(ps_idx_any, i):
+            item = ps_idx_any
+            if isinstance(ps_idx_any, (list, tuple)) and len(ps_idx_any) > 0:
+                item = ps_idx_any[i if i < len(ps_idx_any) else -1]
+            if isinstance(item, (list, tuple)):
+                # 如果还是容器，尽力找第一个张量
+                for sub in item:
+                    if torch.is_tensor(sub):
+                        item = sub
+                        break
+            return squeeze_seq_tensor(item) if torch.is_tensor(item) else None
 
         L = len(tokens_list)
-        # 3) 选择4个层（和 ViT 的 out_indices 思路一致）
+        # 3) 选择4个层（对齐 ViT out_indices 思路）
         if getattr(self, "out_indices", None) is None:
             idxs = [max(1, int(L * 0.25) - 1), int(L * 0.5) - 1, int(L * 0.75) - 1, L - 1]
         else:
@@ -154,10 +180,24 @@ class _VGGTCore(BaseModule):
 
         fmap_list = []
         for i in idxs:
-            toks = squeeze_seq(tokens_list[i])  # [B,T,Ctok]
-            ps = squeeze_seq(ps_idx_list[i]) if isinstance(ps_idx_list, (list, tuple)) else squeeze_seq(ps_idx_list)
-            # 4) tokens -> fmap（注意 T 可能是 6825，而 h*w=62*110=6820，必须用 ps_idx 做 scatter 复原）
-            fmap = tokens_to_map(toks, ps, h, w)  # [B,Ctok,h,w]
+            toks = squeeze_seq_tensor(tokens_list[i])  # -> [B,T,Ctok]
+            ps = pick_ps_idx(ps_idx_raw, i)  # -> [B,T]/[B,T,2] 或 None
+
+            # 4) tokens -> fmap（无 ps_idx 时裁/填到 h*w）
+            B2, T, Ctok = toks.shape
+            if (ps is None) or (not torch.is_tensor(ps)):
+                # 无索引：裁/填到 h*w，然后 reshape
+                Thw = h * w
+                if T >= Thw:
+                    toks_use = toks[:, :Thw, :]
+                else:
+                    pad = Thw - T
+                    toks_use = torch.cat([toks, toks.new_zeros(B2, pad, Ctok)], dim=1)
+                fmap = toks_use.transpose(1, 2).reshape(B2, Ctok, h, w)
+            else:
+                # 有索引：按 idx/scatter 复原（你已有 tokens_to_map）
+                fmap = tokens_to_map(toks, ps, h, w)
+
             fmap_list.append(fmap)
 
         # 第一次运行后初始化 1×1 conv，把 Ctok 映到 192

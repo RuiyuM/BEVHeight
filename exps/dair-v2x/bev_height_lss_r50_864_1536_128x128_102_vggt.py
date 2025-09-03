@@ -92,7 +92,7 @@ from utils.backup_files import backup_codebase
 
 H = 1080
 W = 1920
-final_dim = (864, 1536)
+final_dim = (512, 512)
 img_conf = dict(img_mean=[123.675, 116.28, 103.53],
                 img_std=[58.395, 57.12, 57.375],
                 to_rgb=True)
@@ -130,7 +130,7 @@ backbone_conf = {
         type='SECONDFPN',
         in_channels=[256, 256, 256, 256],
         upsample_strides=[1, 1, 1, 1],
-        out_channels=[192, 192, 192, 192]
+        out_channels=[128, 128, 128, 128]
     ),
 
     # ③ HeightNet 不变（4×128=512）
@@ -449,14 +449,14 @@ def main(args: Namespace) -> None:
     print(args)
     
     model = BEVHeightLightningModel(**vars(args))
-    checkpoint_callback = ModelCheckpoint(dirpath='./outputs/bev_height_lss_r50_864_1536_128x128_transformer/checkpoints', filename='{epoch}', every_n_epochs=5, save_last=True, save_top_k=-1)
+    checkpoint_callback = ModelCheckpoint(dirpath='/data/rxm210041/outputs/bev_height_lss_r50_864_1536_128x128_transformer/checkpoints', filename='{epoch}', every_n_epochs=5, save_last=True, save_top_k=-1)
     trainer = pl.Trainer.from_argparse_args(args, callbacks=[checkpoint_callback])
     if args.evaluate:
         for ckpt_name in os.listdir(args.ckpt_path):
             model_pth = os.path.join(args.ckpt_path, ckpt_name)
             trainer.test(model, ckpt_path=model_pth)
     else:
-        backup_codebase(os.path.join('./outputs/bev_height_lss_r50_864_1536_128x128_transformer', 'backup'))
+        backup_codebase(os.path.join('/data/rxm210041/outputs/bev_height_lss_r50_864_1536_128x128_transformer', 'backup'))
         trainer.fit(model)
         
 def run_cli():
@@ -484,7 +484,7 @@ def run_cli():
         limit_val_batches=0,
         enable_checkpointing=True,
         precision=32,
-        default_root_dir='./outputs/bev_height_lss_r50_864_1536_128x128_transformer')
+        default_root_dir='/data/rxm210041/outputs/bev_height_lss_r50_864_1536_128x128_transformer')
     args = parser.parse_args()
     main(args)
 
