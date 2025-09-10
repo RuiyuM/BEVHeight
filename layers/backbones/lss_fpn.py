@@ -1,6 +1,6 @@
 # Copyright (c) Megvii Inc. All rights reserved.
 import numpy as np
-
+from vggt_c5_injector import VGGT_C5_Injector
 import torch
 import torch.nn.functional as F
 from mmcv.cnn import build_conv_layer
@@ -385,6 +385,8 @@ class LSSFPN(nn.Module):
 
     def get_cam_feats(self, imgs):
         """Get feature maps from images."""
+        imgs = F.interpolate(imgs.flatten(0, 2), size=(512, 512), mode="bilinear", align_corners=False).reshape(*imgs.shape[:3], imgs.shape[3], 512, 512)
+
         batch_size, num_sweeps, num_cams, num_channels, imH, imW = imgs.shape
 
         imgs = imgs.flatten().view(batch_size * num_sweeps * num_cams,
