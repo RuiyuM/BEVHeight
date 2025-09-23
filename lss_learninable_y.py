@@ -282,6 +282,15 @@ class LSSFPN(nn.Module):
         self._init_bev_grid(x_bound, y_bound, True)  # 或者给个 beta=2.0 试远密近疏
         self.adapter = None
         self.learn_y = True
+        self.apply_bev_mask = True  # 开：把可见扇形mask乘到BEV特征上
+        self.mask_dilate_ks = 5  # 可见区做一点膨胀，避免边缘漏掉（奇数：3/5/7）
+        self.mask_blur_ks = 0  # 若想软边界，可设为 3/5（=avg pool 模糊）；0 表示不用
+        self._vis_mask_bev = None  # 训练时可选记录一下（给你看 coverage）
+
+        def pop_vis_mask_bev(self):
+            m = self._vis_mask_bev
+            self._vis_mask_bev = None
+            return m
 
         self.register_buffer(
             'voxel_size',
@@ -451,32 +460,54 @@ class LSSFPN(nn.Module):
         return lambda_smooth * smooth + lambda_shape * shape
     # ---------- 4) 从多相机特征拉到 BEV ----------
     def _ipm_from_feats(self, feats, sensor2ego, intrin, ida, img_hw):
-        """
-        feats:      (B,N,C,Hf,Wf)  来自你的 backbone+neck 的 key-frame 特征
-        sensor2ego: (B,N,4,4)
-        intrin:     (B,N,4,4)
-        ida:        (B,N,4,4)
-        img_hw:     (Himg,Wimg)
-        return:     (B, C_out, HB, WB)
-        """
+        import torch.nn.functional as F
         B, N, C, Hf, Wf = feats.shape
         grid = self._compute_pixel_grid(sensor2ego, intrin, ida, img_hw, (Hf, Wf))  # (B,N,HB,WB,2)
 
-        # 多相机拉采样并融合
+        # --- grid_sample 多相机融合 ---
         bev = None
         for n in range(N):
             grid_n = grid[:, n]  # (B,HB,WB,2)
             feat_n = feats[:, n]  # (B,C,Hf,Wf)
             bev_n = F.grid_sample(
-                feat_n, grid_n, mode='bilinear', padding_mode='zeros',
-                align_corners=self.align_corners
+                feat_n, grid_n, mode='bilinear',
+                padding_mode='zeros', align_corners=self.align_corners
             )  # (B,C,HB,WB)
             bev = bev_n if bev is None else (bev + bev_n)
 
-        # 通道适配到指定的 output_channels
+        # --- 计算可见区域 mask（多相机并集）---
+        with torch.no_grad():
+            vis_list = []
+            for n in range(N):
+                g = grid[:, n]
+                inb = ((g[..., 0] >= -1) & (g[..., 0] <= 1) &
+                       (g[..., 1] >= -1) & (g[..., 1] <= 1)).float()  # (B,HB,WB)
+                vis_list.append(inb)
+            vis = torch.stack(vis_list, dim=1).amax(dim=1)  # (B,HB,WB)
+
+            # 轻微膨胀，避免边缘 BEV 栅格被误判不可见
+            if self.mask_dilate_ks and self.mask_dilate_ks > 1:
+                pad = self.mask_dilate_ks // 2
+                vis = F.max_pool2d(vis.unsqueeze(1), kernel_size=self.mask_dilate_ks,
+                                   stride=1, padding=pad).squeeze(1)  # 仍是 0/1
+            # 可选：做个小模糊，得到软边界（不是必须）
+            if self.mask_blur_ks and self.mask_blur_ks > 1:
+                pad = self.mask_blur_ks // 2
+                vis = F.avg_pool2d(vis.unsqueeze(1).float(),
+                                   kernel_size=self.mask_blur_ks,
+                                   stride=1, padding=pad).squeeze(1).clamp(0, 1)
+
+            self._vis_mask_bev = vis  # 训练时可在 Lightning 里 log coverage
+
+        # --- 通道适配 ---
         if self.adapter is None:
             self.adapter = nn.Conv2d(C, self.output_channels, kernel_size=1, bias=False).to(feats.device)
-        bev = self.adapter(bev)  # (B, C_out, HB, WB)
+        bev = self.adapter(bev)  # (B, Cout, HB, WB)
+
+        # --- 直接把 mask 乘到 BEV 特征上（最关键的一行） ---
+        if self.apply_bev_mask and (self._vis_mask_bev is not None):
+            bev = bev * self._vis_mask_bev.unsqueeze(1)  # (B,1,HB,WB) broadcast
+
         return bev
 
     def _configure_height_net(self, height_net_conf):
