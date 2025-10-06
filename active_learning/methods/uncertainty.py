@@ -48,7 +48,7 @@ class UncertaintySelector(BaseActiveSelector):
             else:
                 dets = model.model.get_bboxes(preds, img_metas)
 
-            # dets[i] = (bboxes[Tensor(N, 9)], scores[Tensor(N)], labels[Tensor(N)],)
+            # dets[i] = (bboxes[Tensor(N, 9)], scores[Tensor(N)], labels[Tensor(N)],)  
             for i in range(len(dets)):
                 bboxes, scores, labels = dets[i][:3]
                 # Move to CPU numpy for simple math
@@ -75,4 +75,3 @@ class UncertaintySelector(BaseActiveSelector):
                 scores_per_image.append((cls_unc + reg_unc) / 2.0)
 
         return scores_per_image
-

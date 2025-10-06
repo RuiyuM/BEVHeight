@@ -328,26 +328,10 @@ def run_cli():
         precision=32, default_root_dir='/data/rxm210041/outputs/bev_height_al'
     )
     args = parser.parse_args()
+    # 自动把 active method 拼到输出目录名上
+    if getattr(args, "al_enabled", False) and getattr(args, "al_method", ""):
+        args.default_root_dir = f"{args.default_root_dir}_{args.al_method}"
     main(args)
 
 if __name__ == '__main__':
     run_cli()
-
-# =============================
-# USAGE EXAMPLE
-# =============================
-# 1) Place files:
-#    active_learning/
-#      __init__.py (optional)
-#      base.py
-#      runner.py
-#      methods/
-#        __init__.py
-#        uncertainty.py
-# 2) Add the new training script at:
-#    exps/dair-v2x/bev_height_lss_r50_864_1536_128x128_active.py
-# 3) Run (single GPU recommended initially):
-#    python exps/dair-v2x/bev_height_lss_r50_864_1536_128x128_active.py \
-#      --al_enabled --al_method uncertainty \
-#      --al_init_size 100 --al_query_size 100 --al_rounds 5 \
-#      --al_epochs_per_round 10 --batch_size_per_device 8 --devices 1

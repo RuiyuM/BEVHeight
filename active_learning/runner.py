@@ -123,4 +123,3 @@ class ActiveLearner:
             self.unlabeled_indices = sorted(list(pool_set - picked_set))
 
         print("[AL] Finished all rounds.")
-
