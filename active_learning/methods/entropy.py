@@ -33,6 +33,9 @@ class EntropySelector(BaseActiveSelector):
                 sweep_imgs = sweep_imgs.to(device, non_blocking=True)
 
             # forward
+            if next(model.model.parameters()).device != device:
+                model.model.to(device)
+
             preds = model.model(sweep_imgs, mats)
 
             # Try path (A): per-detection class logits

@@ -1,3 +1,6 @@
+# =============================
+# File: active_learning/base.py
+# =============================
 from __future__ import annotations
 from typing import Dict, List, Tuple, Any
 import torch
@@ -39,6 +42,4 @@ class BaseActiveSelector:
         topk_rel = torch.topk(torch.tensor(scores), k=min(k, len(scores))).indices.tolist()
         chosen = [unlabeled_indices[i] for i in topk_rel]
         return chosen
-
-
 
