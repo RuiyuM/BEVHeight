@@ -112,6 +112,9 @@ class BEVHeightLightningModel(LightningModule):
         super().__init__()
         self.save_hyperparameters()
         self.gpus = gpus
+        # --- PL compatibility: record CLI device hints for LR scaling
+        self._devices_arg = kwargs.get('devices', None)
+        self._num_nodes_arg = kwargs.get('num_nodes', 1)
         self.eval_interval = eval_interval
         self.batch_size_per_device = batch_size_per_device
         self.data_root = data_root
@@ -228,7 +231,30 @@ class BEVHeightLightningModel(LightningModule):
             self.evaluator.evaluate(all_pred_results, all_img_metas)
 
     def configure_optimizers(self):
-        lr = self.basic_lr_per_img * self.batch_size_per_device * self.gpus
+        # Robustly infer world size across PL versions
+        world = getattr(self.trainer, "world_size", None)
+        if world is None:
+            world = getattr(self.trainer, "num_devices", None)
+        if world is None:
+            # Fallback to model args
+            world = None
+            if isinstance(self.gpus, int):
+                world = self.gpus
+            elif isinstance(self.gpus, (list, tuple)):
+                world = len(self.gpus)
+            if world is None:
+                dv = self._devices_arg
+                try:
+                    world = int(dv) if dv is not None else 1
+                except Exception:
+                    world = len(dv) if isinstance(dv, (list, tuple)) else 1
+        try:
+            world = int(world)
+        except Exception:
+            world = 1
+        world = max(1, world)
+
+        lr = self.basic_lr_per_img * self.batch_size_per_device * world
         optimizer = torch.optim.AdamW(self.model.parameters(), lr=lr, weight_decay=1e-7)
         scheduler = MultiStepLR(optimizer, [19, 23])
         return [[optimizer], [scheduler]]
@@ -322,11 +348,14 @@ def run_cli():
 
     parser = BEVHeightLightningModel.add_model_specific_args(parent_parser)
     parser.set_defaults(
-        profiler='simple', deterministic=False, max_epochs=100,
-        accelerator='gpu', devices=1,  # safer default for AL; override as needed
-        num_sanity_val_steps=0, gradient_clip_val=5, limit_val_batches=0, enable_checkpointing=True,
-        precision=32, default_root_dir='/data/rxm210041/outputs/bev_height_al'
-    )
+    profiler='simple', deterministic=False, max_epochs=100,
+    accelerator='gpu', devices=1,  # safer default for AL; override as needed
+    num_sanity_val_steps=0, gradient_clip_val=5, limit_val_batches=0, enable_checkpointing=True,
+    precision=32, default_root_dir='/data/rxm210041/outputs/bev_height_al'
+)
+    # Object budget CLI
+    parent_parser.add_argument('--al_max_objects', type=int, default=12000,
+                           help='Max total labeled objects (GT boxes). Stop/limit querying when reached (soft cap).')
     args = parser.parse_args()
     # 自动把 active method 拼到输出目录名上
     if getattr(args, "al_enabled", False) and getattr(args, "al_method", ""):
@@ -335,3 +364,23 @@ def run_cli():
 
 if __name__ == '__main__':
     run_cli()
+
+# =============================
+# USAGE EXAMPLE
+# =============================
+# 1) Place files:
+#    active_learning/
+#      __init__.py (optional)
+#      base.py
+#      runner.py
+#      methods/
+#        __init__.py
+#        uncertainty.py
+# 2) Add the new training script at:
+#    exps/dair-v2x/bev_height_lss_r50_864_1536_128x128_active.py
+# 3) Run (single GPU recommended initially):
+#    python exps/dair-v2x/bev_height_lss_r50_864_1536_128x128_active.py \
+#      --al_enabled --al_method uncertainty \
+#      --al_init_size 100 --al_query_size 100 --al_rounds 5 \
+#      --al_epochs_per_round 10 --batch_size_per_device 8 --devices 1 \
+#      --al_max_objects 3000
