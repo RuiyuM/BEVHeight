@@ -354,7 +354,7 @@ def run_cli():
     precision=32, default_root_dir='/data/rxm210041/outputs/bev_height_al'
 )
     # Object budget CLI
-    parent_parser.add_argument('--al_max_objects', type=int, default=12000,
+    parent_parser.add_argument('--al_max_objects', type=int, default=10000,
                            help='Max total labeled objects (GT boxes). Stop/limit querying when reached (soft cap).')
     args = parser.parse_args()
     # 自动把 active method 拼到输出目录名上
