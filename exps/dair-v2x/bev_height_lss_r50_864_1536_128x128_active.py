@@ -146,6 +146,7 @@ class BEVHeightLightningModel(LightningModule):
         self._labeled_indices = None
         self._train_dataset = None
 
+
     # ### [AL-HOOK]
     def set_labeled_indices(self, indices):
         self._labeled_indices = sorted(indices) if indices is not None else None
@@ -340,9 +341,9 @@ def run_cli():
     # ### [AL-HOOK] CLI arguments for active learning
     parent_parser.add_argument('--al_enabled', action='store_true', help='Enable active learning loop')
     parent_parser.add_argument('--al_method', type=str, default='uncertainty', help='Active method name (e.g., uncertainty)')
-    parent_parser.add_argument('--al_init_size', type=int, default=100, help='Initial random labeled images')
-    parent_parser.add_argument('--al_query_size', type=int, default=100, help='Images to add per AL round')
-    parent_parser.add_argument('--al_rounds', type=int, default=5, help='Number of AL query rounds')
+    parent_parser.add_argument('--al_init_size', type=int, default=500, help='Initial random labeled images')
+    parent_parser.add_argument('--al_query_size', type=int, default=50, help='Images to add per AL round')
+    parent_parser.add_argument('--al_rounds', type=int, default=10, help='Number of AL query rounds')
     parent_parser.add_argument('--al_epochs_per_round', type=int, default=10, help='Train epochs per AL round')
     parent_parser.add_argument('--al_pool_seed', type=int, default=0, help='Seed for initial pool split')
 
@@ -354,7 +355,7 @@ def run_cli():
     precision=32, default_root_dir='/data/rxm210041/outputs/bev_height_al'
 )
     # Object budget CLI
-    parent_parser.add_argument('--al_max_objects', type=int, default=10000,
+    parent_parser.add_argument('--al_max_objects', type=int, default=8000,
                            help='Max total labeled objects (GT boxes). Stop/limit querying when reached (soft cap).')
     args = parser.parse_args()
     # 自动把 active method 拼到输出目录名上
