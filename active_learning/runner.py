@@ -123,6 +123,18 @@ class ActiveLearner:
         self._gt_count_cache: Dict[int, int] = {}
         self._budget_exhausted = False
 
+        # [SEED-OFFSET] whether to exclude seed objects from budget
+        self.ignore_seed_in_budget: bool = bool(getattr(args, 'al_ignore_seed_in_budget', True))
+        self._seed_indices_snapshot: Optional[List[int]] = None
+        self._seed_obj_offset: int = 0
+
+        # [SEED-OFFSET] Take snapshot right after pools are initialized
+        if self.ignore_seed_in_budget:
+            self._seed_indices_snapshot = list(self.labeled_indices)
+            self._seed_obj_offset = self._total_objects(self._seed_indices_snapshot) if self._seed_indices_snapshot else 0
+            print(f"[AL] Seed snapshot: images={len(self._seed_indices_snapshot)} | "
+                  f"objects={self._seed_obj_offset} (excluded from budget)")
+
     # ---------------------
     # Pools
     # ---------------------
@@ -192,26 +204,35 @@ class ActiveLearner:
             total += _count_from_batch_tuple(batch)
         return int(total)
 
+    # [SEED-OFFSET]
+    def _spent_objects(self) -> int:
+        """Objects that count against the budget (exclude seed if enabled)."""
+        total = self._total_objects(self.labeled_indices)
+        if not self.ignore_seed_in_budget:
+            return total
+        return max(0, total - self._seed_obj_offset)
+
+    # [SEED-OFFSET] version of cap function
     def _cap_by_object_budget(self, picked_in_order: List[int]) -> List[int]:
         """Hard cap AFTER whole-image annotation.
         Add images following method order until crossing the cap; keep the image that crosses, then stop.
+        Uses *spent* objects (excluding seed) for comparisons.
         """
         if not self.obj_budget:
             return picked_in_order
 
         cap = int(self.obj_budget)
-        current = self._total_objects(self.labeled_indices)
+        current_spent = self._spent_objects()
 
         kept: List[int] = []
-        added_objs = 0
+        added_spent = 0
         for idx in picked_in_order:
             c = self._gt_count_for_index(idx)
             kept.append(idx)
-            added_objs += c
-            new_total = current + added_objs
-            if new_total > cap:
-                # Optionally allow a tiny overshoot; here we keep the crossing image and stop.
-                print(f"[AL] Reached cap after this image: {new_total} > {cap}. Stop querying this round.")
+            added_spent += c
+            new_spent = current_spent + added_spent
+            if new_spent > cap:
+                print(f"[AL] Reached cap (excluding seed) after this image: {new_spent} > {cap}. Stop querying this round.")
                 break
         return kept
 
@@ -263,12 +284,12 @@ class ActiveLearner:
             if r == R - 1:
                 continue
 
-            # Budget check
+            # [SEED-OFFSET] Budget check with 'spent' (exclude seed)
             if self.obj_budget:
-                current_objs = self._total_objects(self.labeled_indices)
-                print(f"[AL] Labeled objects so far: {current_objs} (cap={self.obj_budget})")
-                if current_objs >= self.obj_budget:
-                    print("[AL] Object cap reached. Will SKIP further querying but continue training.")
+                spent = self._spent_objects()
+                print(f"[AL] Labeled objects so far (excluding seed={self._seed_obj_offset}): {spent} (cap={self.obj_budget})")
+                if spent >= self.obj_budget:
+                    print("[AL] Object cap reached (excluding seed). Will SKIP further querying but continue training.")
                     continue  # skip query, next round still trains on same set
 
             if len(self.unlabeled_indices) == 0:
@@ -286,8 +307,10 @@ class ActiveLearner:
             self.labeled_indices = sorted(set(self.labeled_indices).union(picked_set))
             self.unlabeled_indices = sorted(list(pool_set - picked_set))
 
-            # Log
+            # Log (both total & spent)
             tot_objs = self._total_objects(self.labeled_indices)
-            print(f"[AL] After round {r + 1}: labeled_images={len(self.labeled_indices)}, labeled_objects={tot_objs}")
+            spent = self._spent_objects()
+            print(f"[AL] After round {r + 1}: labeled_images={len(self.labeled_indices)}, "
+                  f"labeled_objects_total={tot_objs}, spent(excl. seed)={spent}/{self.obj_budget if self.obj_budget else '∞'}")
 
         print("[AL] Finished all rounds.")
