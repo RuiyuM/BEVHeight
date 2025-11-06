@@ -195,13 +195,13 @@ class HeightNet(nn.Module):
                 groups=4,
                 im2col_step=128,
             )),
-            
+
         )
         self.height_layer = nn.Conv2d(mid_channels,
-                      height_channels,
-                      kernel_size=1,
-                      stride=1,
-                      padding=0)
+                                      height_channels,
+                                      kernel_size=1,
+                                      stride=1,
+                                      padding=0)
 
     def forward(self, x, mats_dict):
         intrins = mats_dict['intrin_mats'][:, 0:1, ..., :3, :3]
@@ -311,14 +311,14 @@ class LSSFPN(nn.Module):
         # make grid in image plane
         ogfH, ogfW = self.final_dim
         fH, fW = ogfH // self.downsample_factor, ogfW // self.downsample_factor
-        
+
         # DID
         alpha = 1.5
         d_coords = np.arange(self.d_bound[2]) / self.d_bound[2]
         d_coords = np.power(d_coords, alpha)
         d_coords = self.d_bound[0] + d_coords * (self.d_bound[1] - self.d_bound[0])
         d_coords = torch.tensor(d_coords, dtype=torch.float).view(-1, 1, 1).expand(-1, fH, fW)
-        
+
         D, _, _ = d_coords.shape
         x_coords = torch.linspace(0, ogfW - 1, fW, dtype=torch.float).view(
             1, 1, fW).expand(D, fH, fW)
@@ -330,13 +330,14 @@ class LSSFPN(nn.Module):
         # D x H x W x 3
         frustum = torch.stack((x_coords, y_coords, d_coords, paddings), -1)
         return frustum
-    
+
     def height2localtion(self, points, sensor2ego_mat, sensor2virtual_mat, intrin_mat, reference_heights):
         batch_size, num_cams, _, _ = sensor2ego_mat.shape
         reference_heights = reference_heights.view(batch_size, num_cams, 1, 1, 1, 1,
-                                                   1).repeat(1, 1, points.shape[2], points.shape[3], points.shape[4], 1, 1)
+                                                   1).repeat(1, 1, points.shape[2], points.shape[3], points.shape[4], 1,
+                                                             1)
         height = -1 * points[:, :, :, :, :, 2, :] + reference_heights[:, :, :, :, :, 0, :]
-        
+
         points_const = points.clone()
         points_const[:, :, :, :, :, 2, :] = 10
         points_const = torch.cat(
@@ -345,14 +346,16 @@ class LSSFPN(nn.Module):
         combine_virtual = sensor2virtual_mat.matmul(torch.inverse(intrin_mat))
         points_virtual = combine_virtual.view(batch_size, num_cams, 1, 1, 1, 4, 4).matmul(points_const)
         ratio = height[:, :, :, :, :, 0] / points_virtual[:, :, :, :, :, 1, 0]
-        ratio = ratio.view(batch_size, num_cams, ratio.shape[2], ratio.shape[3], ratio.shape[4], 1, 1).repeat(1, 1, 1, 1, 1, 4, 1)
+        ratio = ratio.view(batch_size, num_cams, ratio.shape[2], ratio.shape[3], ratio.shape[4], 1, 1).repeat(1, 1, 1,
+                                                                                                              1, 1, 4,
+                                                                                                              1)
         points = points_virtual * ratio
         points[:, :, :, :, :, 3, :] = 1
         combine_ego = sensor2ego_mat.matmul(torch.inverse(sensor2virtual_mat))
         points = combine_ego.view(batch_size, num_cams, 1, 1, 1, 4,
-                              4).matmul(points)
+                                  4).matmul(points)
         return points
-    
+
     def get_geometry(self, sensor2ego_mat, sensor2virtual_mat, intrin_mat, ida_mat, reference_heights, bda_mat):
         """Transfer points from camera coord to ego coord.
 
@@ -368,13 +371,13 @@ class LSSFPN(nn.Module):
             Tensors: points ego coord.
         """
         batch_size, num_cams, _, _ = sensor2ego_mat.shape
-        
+
         # undo post-transformation
         # B x N x D x H x W x 3
         points = self.frustum
         ida_mat = ida_mat.view(batch_size, num_cams, 1, 1, 1, 4, 4)
         points = ida_mat.inverse().matmul(points.unsqueeze(-1))
-        points = self.height2localtion(points, sensor2ego_mat, sensor2virtual_mat, intrin_mat, reference_heights) 
+        points = self.height2localtion(points, sensor2ego_mat, sensor2virtual_mat, intrin_mat, reference_heights)
         if bda_mat is not None:
             bda_mat = bda_mat.unsqueeze(1).repeat(1, num_cams, 1, 1).view(
                 batch_size, num_cams, 1, 1, 1, 4, 4)
@@ -405,7 +408,11 @@ class LSSFPN(nn.Module):
                               sweep_index,
                               sweep_imgs,
                               mats_dict,
-                              is_return_height=False):
+                              is_return_height=False,
+                              return_bin_entropy: bool = False,
+                              return_depth_profile=False, depth_profile_mode="hard",
+                              depth_profile_weight="none"
+                              ):
         """Forward function for single sweep.
 
         Args:
@@ -431,7 +438,7 @@ class LSSFPN(nn.Module):
             Tensor: BEV feature map.
         """
         batch_size, num_sweeps, num_cams, num_channels, img_height, \
-            img_width = sweep_imgs.shape
+        img_width = sweep_imgs.shape
         img_feats = self.get_cam_feats(sweep_imgs)
         source_features = img_feats[:, 0, ...]
         height_feature = self._forward_height_net(
@@ -441,8 +448,49 @@ class LSSFPN(nn.Module):
                                     source_features.shape[4]),
             mats_dict,
         )
-        height = height_feature[:, :self.height_channels].softmax(1)
-        
+        height = height_feature[:, :self.height_channels].softmax(1)  # [B*num_cams, D, fH, fW]
+
+        # ---- 计算 H_img（与现在相同）----
+        if return_bin_entropy:
+            eps = 1e-12
+            D = height.shape[1]
+            H_map = -(height * (height.clamp_min(eps).log())).sum(dim=1) / float(np.log(D))  # [B*num_cams, fH, fW]
+            H_cam = H_map.mean(dim=(1, 2))  # [B*num_cams]
+            B = sweep_imgs.shape[0]
+            num_cams = sweep_imgs.shape[2]
+            H_img = H_cam.view(B, num_cams).mean(dim=1)  # [B]
+        else:
+            H_img = None
+
+        # ---- 计算 m_depth_img: [B, D] （hard-mode，按像素 top-1 统计；相机上求和）----
+        if return_depth_profile:
+            B = sweep_imgs.shape[0]
+            num_cams = sweep_imgs.shape[2]
+            _, D, fH, fW = height.shape
+
+            if depth_profile_mode == "hard":
+                top1_prob, top1_idx = height.max(dim=1)  # [B*num_cams, fH, fW]
+                if depth_profile_weight == "top1":
+                    w = top1_prob.reshape(B * num_cams, -1)  # [B*num_cams, fH*fW]
+                elif depth_profile_weight == "margin":
+                    # 取第二大概率
+                    top2_prob = height.topk(k=2, dim=1).values[:, 1, :, :]  # [B*num_cams, fH, fW]
+                    w = (top1_prob - top2_prob).clamp_min(0).reshape(B * num_cams, -1)
+                else:
+                    w = torch.ones(B * num_cams, fH * fW, device=height.device, dtype=height.dtype)
+
+                idx_flat = top1_idx.reshape(B * num_cams, -1)  # [L, Npix]
+                m_flat = torch.zeros(B * num_cams, D, device=height.device, dtype=height.dtype)
+                m_flat.scatter_add_(1, idx_flat, w)  # 按 top-1 累加权重
+                m_img = m_flat.view(B, num_cams, D).sum(dim=1)  # 相机上求和 -> [B, D]
+            else:
+                # soft-mode：空间平均概率（可再做幂次锐化）
+                m_cam = height.mean(dim=(2, 3))  # [B*num_cams, D]
+                m_img = m_cam.view(B, num_cams, D).mean(dim=1)  # [B, D]
+
+            m_depth_img = m_img / (m_img.sum(dim=1, keepdim=True).clamp_min(1e-6))  # L1 归一
+        else:
+            m_depth_img = None
         img_feat_with_height = height.unsqueeze(
             1) * height_feature[:, self.height_channels:(
                 self.height_channels + self.output_channels)].unsqueeze(2)
@@ -456,7 +504,7 @@ class LSSFPN(nn.Module):
             img_feat_with_height.shape[3],
             img_feat_with_height.shape[4],
         )
-        
+
         geom_xyz = self.get_geometry(
             mats_dict['sensor2ego_mats'][:, sweep_index, ...],
             mats_dict['sensor2virtual_mats'][:, sweep_index, ...],
@@ -468,68 +516,42 @@ class LSSFPN(nn.Module):
         img_feat_with_height = img_feat_with_height.permute(0, 1, 3, 4, 5, 2)
         geom_xyz = ((geom_xyz - (self.voxel_coord - self.voxel_size / 2.0)) /
                     self.voxel_size).int()
-        
+
         feature_map = voxel_pooling(geom_xyz, img_feat_with_height.contiguous(),
-                                   self.voxel_num.cuda())
-        
+                                    self.voxel_num.cuda())
+        if return_bin_entropy and return_depth_profile:
+            return feature_map.contiguous(), H_img, m_depth_img
+        if is_return_height and return_bin_entropy:
+            return (feature_map.contiguous(), height, H_img)  # <<< 返回三元组
         if is_return_height:
             return feature_map.contiguous(), height
+        if return_bin_entropy:
+            return feature_map.contiguous(), H_img  # <<< 返回二元组
         return feature_map.contiguous()
 
-    def forward(self,
-                sweep_imgs,
-                mats_dict,
-                timestamps=None,
-                is_return_height=False):
-        """Forward function.
-
-        Args:
-            sweep_imgs(Tensor): Input images with shape of (B, num_sweeps,
-                num_cameras, 3, H, W).
-            mats_dict(dict):
-                sensor2ego_mats(Tensor): Transformation matrix from
-                    camera to ego with shape of (B, num_sweeps,
-                    num_cameras, 4, 4).
-                intrin_mats(Tensor): Intrinsic matrix with shape
-                    of (B, num_sweeps, num_cameras, 4, 4).
-                ida_mats(Tensor): Transformation matrix for ida with
-                    shape of (B, num_sweeps, num_cameras, 4, 4).
-                sensor2sensor_mats(Tensor): Transformation matrix
-                    from key frame camera to sweep frame camera with
-                    shape of (B, num_sweeps, num_cameras, 4, 4).
-                bda_mat(Tensor): Rotation matrix for bda with shape
-                    of (B, 4, 4).
-            timestamps(Tensor): Timestamp for all images with the shape of(B,
-                num_sweeps, num_cameras).
-
-        Return:
-            Tensor: bev feature map.
-        """
-        batch_size, num_sweeps, num_cams, num_channels, img_height, \
-            img_width = sweep_imgs.shape
-
-        key_frame_res = self._forward_single_sweep(
-            0,
-            sweep_imgs[:, 0:1, ...],
+    def forward(
+            self,
+            sweep_imgs,
             mats_dict,
-            is_return_height=is_return_height)
-        if num_sweeps == 1:
-            return key_frame_res
+            timestamps=None,
+            is_return_height: bool = False,
+            return_bin_entropy: bool = False,
+            return_depth_profile: bool = False,  # <<< 新增
+            depth_profile_mode: str = "hard",  # <<< 新增
+            depth_profile_weight: str = "none",  # <<< 新增
+    ):
+        # 只跑 key-frame（index 0）
+        out = self._forward_single_sweep(
+            0,
+            sweep_imgs[:, 0:1, ...],  # (B,1,num_cams,C,H,W)
+            mats_dict,
+            is_return_height=is_return_height,
+            return_bin_entropy=return_bin_entropy,
+            return_depth_profile=return_depth_profile,  # <<< 透传
+            depth_profile_mode=depth_profile_mode,  # <<< 透传
+            depth_profile_weight=depth_profile_weight,  # <<< 透传
+        )
+        # 不要再在这里拆分/改返回；直接把 _forward_single_sweep 的返回原样吐出去
+        return out
 
-        key_frame_feature = key_frame_res[
-            0] if is_return_height else key_frame_res
 
-        ret_feature_list = [key_frame_feature]
-        for sweep_index in range(1, num_sweeps):
-            with torch.no_grad():
-                feature_map = self._forward_single_sweep(
-                    sweep_index,
-                    sweep_imgs[:, sweep_index:sweep_index + 1, ...],
-                    mats_dict,
-                    is_return_height=False)
-                ret_feature_list.append(feature_map)
-
-        if is_return_height:
-            return torch.cat(ret_feature_list, 1), key_frame_res[1]
-        else:
-            return torch.cat(ret_feature_list, 1)
