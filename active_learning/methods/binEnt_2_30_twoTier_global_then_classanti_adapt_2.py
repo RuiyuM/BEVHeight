@@ -635,6 +635,6 @@ class BinEnt30_TwoTier_GlobalThenClassAntiAdaptiveSelector_2(BaseActiveSelector)
 # ===== 注册（沿用原方法名，直接替换为简化+greedy 版 Stage-C） =====
 try:
     from active_learning.methods import _METHOD_REGISTRY
-    _METHOD_REGISTRY["binEnt30_twoTier_global_then_classanti_adapt"] = BinEnt30_TwoTier_GlobalThenClassAntiAdaptiveSelector_2
+    _METHOD_REGISTRY["binEnt30_twoTier_global_then_classanti_adapt_2"] = BinEnt30_TwoTier_GlobalThenClassAntiAdaptiveSelector_2
 except Exception:
     pass
