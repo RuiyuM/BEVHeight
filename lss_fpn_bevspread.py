@@ -111,10 +111,19 @@ class SELayer(nn.Module):
         self.gate = gate_layer()
 
     def forward(self, x, x_se):
-        x_se = self.conv_reduce(x_se); x_se = self.act1(x_se); x_se = self.conv_expand(x_se)
+        """
+        x:    [B*N_cam, C, H, W]
+        x_se: [B*N_cam, C, 1, 1]
+        """
+        x_se = self.conv_reduce(x_se)
+        x_se = self.act1(x_se)
+        x_se = self.conv_expand(x_se)
         return x * self.gate(x_se)
 
 
+# -----------------------------
+#   DepthNet（带相机-aware SE）
+# -----------------------------
 class DepthNet(nn.Module):
     def __init__(self, in_channels, mid_channels, context_channels, depth_channels):
         super(DepthNet, self).__init__()
@@ -142,12 +151,16 @@ class DepthNet(nn.Module):
         self.depth_layer = nn.Conv2d(mid_channels, depth_channels, kernel_size=1, stride=1, padding=0)
 
     def forward(self, x, mats_dict):
-        intrins = mats_dict['intrin_mats'][:, 0:1, ..., :3, :3]
+        """
+        x: [B * N_cam, C_in, Hf, Wf]
+        """
+        intrins = mats_dict['intrin_mats'][:, 0:1, ..., :3, :3]          # [B,1,N,3,3]
         batch_size = intrins.shape[0]
         num_cams = intrins.shape[2]
-        ida = mats_dict['ida_mats'][:, 0:1, ...]
-        sensor2ego = mats_dict['sensor2ego_mats'][:, 0:1, ..., :3, :]
+        ida = mats_dict['ida_mats'][:, 0:1, ...]                         # [B,1,N,4,4]
+        sensor2ego = mats_dict['sensor2ego_mats'][:, 0:1, ..., :3, :]    # [B,1,N,3,4]
         bda = mats_dict['bda_mat'].view(batch_size, 1, 1, 4, 4).repeat(1, 1, num_cams, 1, 1)
+
         mlp_input = torch.cat(
             [
                 torch.stack(
@@ -173,19 +186,31 @@ class DepthNet(nn.Module):
                 sensor2ego.view(batch_size, 1, num_cams, -1),
             ],
             -1,
-        )
-        self.bn(mlp_input.reshape(-1, mlp_input.shape[-1]))  # 只做 BN 以提供上下文；输出未直接使用
-        x = self.reduce_conv(x)
-        context_se = self.context_mlp(mlp_input)[..., None, None]
+        )  # [B,1,N_cam,27]
+
+        # 展平到 [B*N_cam, 27]，过 BN + MLP
+        mlp_input = mlp_input.view(batch_size * num_cams, -1)   # [B*N_cam, 27]
+        mlp_input = self.bn(mlp_input)                          # [B*N_cam, 27]
+
+        x = self.reduce_conv(x)                                 # [B*N_cam, mid, Hf, Wf]
+
+        # context 分支
+        context_se = self.context_mlp(mlp_input).view(batch_size * num_cams, -1, 1, 1)
         context = self.context_se(x, context_se)
         context = self.context_conv(context)
-        depth_se = self.depth_mlp(mlp_input)[..., None, None]
+
+        # depth 分支
+        depth_se = self.depth_mlp(mlp_input).view(batch_size * num_cams, -1, 1, 1)
         depth = self.depth_se(x, depth_se)
         depth = self.depth_conv(depth)
         depth = self.depth_layer(depth)
+
         return torch.cat([depth, context], dim=1)
 
 
+# -----------------------------
+#   HeightNet（原始 BEVHeight 版）
+# -----------------------------
 class HeightNet(nn.Module):
     def __init__(self, in_channels, mid_channels, context_channels, height_channels):
         super(HeightNet, self).__init__()
@@ -206,19 +231,23 @@ class HeightNet(nn.Module):
             BasicBlock(mid_channels, mid_channels),
             ASPP(mid_channels, mid_channels),
             build_conv_layer(cfg=dict(
-                type='DCN', in_channels=mid_channels, out_channels=mid_channels, kernel_size=3,
-                padding=1, groups=4, im2col_step=128,
+                type='DCN', in_channels=mid_channels, out_channels=mid_channels,
+                kernel_size=3, padding=1, groups=4, im2col_step=128,
             )),
         )
         self.height_layer = nn.Conv2d(mid_channels, height_channels, kernel_size=1, stride=1, padding=0)
 
     def forward(self, x, mats_dict):
+        """
+        x: [B * N_cam, C_in, Hf, Wf]
+        """
         intrins = mats_dict['intrin_mats'][:, 0:1, ..., :3, :3]
         batch_size = intrins.shape[0]
         num_cams = intrins.shape[2]
         ida = mats_dict['ida_mats'][:, 0:1, ...]
         sensor2ego = mats_dict['sensor2ego_mats'][:, 0:1, ..., :3, :]
         bda = mats_dict['bda_mat'].view(batch_size, 1, 1, 4, 4).repeat(1, 1, num_cams, 1, 1)
+
         mlp_input = torch.cat(
             [
                 torch.stack(
@@ -244,16 +273,25 @@ class HeightNet(nn.Module):
                 sensor2ego.view(batch_size, 1, num_cams, -1),
             ],
             -1,
-        )
-        self.bn(mlp_input.reshape(-1, mlp_input.shape[-1]))
-        x = self.reduce_conv(x)
-        context_se = self.context_mlp(mlp_input)[..., None, None]
+        )  # [B,1,N_cam,27]
+
+        # 展平到 [B*N_cam, 27]，过 BN + MLP
+        mlp_input = mlp_input.view(batch_size * num_cams, -1)   # [B*N_cam, 27]
+        mlp_input = self.bn(mlp_input)                          # [B*N_cam, 27]
+
+        x = self.reduce_conv(x)                                 # [B*N_cam, mid, Hf, Wf]
+
+        # context 分支
+        context_se = self.context_mlp(mlp_input).view(batch_size * num_cams, -1, 1, 1)
         context = self.context_se(x, context_se)
         context = self.context_conv(context)
-        height_se = self.height_mlp(mlp_input)[..., None, None]
+
+        # height 分支
+        height_se = self.height_mlp(mlp_input).view(batch_size * num_cams, -1, 1, 1)
         height = self.height_se(x, height_se)
         height = self.height_conv(height)
         height = self.height_layer(height)
+
         return torch.cat([height, context], dim=1)
 
 
@@ -266,6 +304,7 @@ class LSSFPN(nn.Module):
       - 正常前向：返回 BEV 特征（以及可选的 height 概率）
       - 主动学习模式：`return_bin_entropy=True` 时，额外返回 H_img ∈ ℝ[B]
         （来自 key-frame 的 height 概率沿 D 维的分箱熵，空间 & 相机平均）
+      - use_spread=True 时，启用 BEVSpread 邻域扩散
     """
     def __init__(self, x_bound, y_bound, z_bound, d_bound, final_dim,
                  downsample_factor, output_channels, img_backbone_conf,
@@ -291,6 +330,7 @@ class LSSFPN(nn.Module):
         self.img_neck.init_weights()
         self.img_backbone.init_weights()
 
+        # BEVSpread 衰减因子
         self.beta = nn.Parameter(torch.tensor(1/64), requires_grad=True)
 
         # 供主动学习选择器自动读取 xyz/d 网格信息
@@ -311,11 +351,10 @@ class LSSFPN(nn.Module):
         )
 
     def create_frustum(self):
-        """Generate frustum with non-linear depth spacing."""
+        """Generate frustum with non-linear depth spacing (DID)."""
         ogfH, ogfW = self.final_dim
         fH, fW = ogfH // self.downsample_factor, ogfW // self.downsample_factor
 
-        # depth indices with power-law spacing
         alpha = 1.5
         d_coords = np.arange(self.d_bound[2]) / self.d_bound[2]
         d_coords = np.power(d_coords, alpha)
@@ -327,7 +366,7 @@ class LSSFPN(nn.Module):
         y_coords = torch.linspace(0, ogfH - 1, fH, dtype=torch.float).view(1, fH, 1).expand(D, fH, fW)
         paddings = torch.ones_like(d_coords)
 
-        # D x H x W x 3(+1)
+        # D x H x W x 4
         frustum = torch.stack((x_coords, y_coords, d_coords, paddings), -1)
         return frustum
 
@@ -354,7 +393,7 @@ class LSSFPN(nn.Module):
         return points
 
     def get_geometry(self, sensor2ego_mat, sensor2virtual_mat, intrin_mat, ida_mat, reference_heights, bda_mat):
-        """Transfer points from camera coord to ego coord."""
+        """Transfer points from camera coord to ego coord, return (xyz, depth)."""
         batch_size, num_cams, _, _ = sensor2ego_mat.shape
 
         points = self.frustum
@@ -372,7 +411,7 @@ class LSSFPN(nn.Module):
             1, 1, coods.shape[2], coods.shape[3], coods.shape[4], 1, 1)
         depth = ((MAT2[:, :, :, :, :, 2, 0] + points[:, :, :, :, :, 2, 0]) / MAT1[:, :, :, :, :, 2, 0]).view(
             batch_size, num_cams, coods.shape[2], coods.shape[3], coods.shape[4], 1, 1)
-        depth = depth.squeeze(-1)
+        depth = depth.squeeze(-1)  # [B, N, D, Hf, Wf]
 
         points = self.height2localtion(points, sensor2ego_mat, sensor2virtual_mat, intrin_mat, reference_heights)
         if bda_mat is not None:
@@ -380,14 +419,15 @@ class LSSFPN(nn.Module):
             points = (bda_mat @ points).squeeze(-1)
         else:
             points = points.squeeze(-1)
-        return points[..., :3], depth
+        return points[..., :3], depth  # xyz, depth
 
     def get_cam_feats(self, imgs):
         """Get feature maps from images."""
         batch_size, num_sweeps, num_cams, num_channels, imH, imW = imgs.shape
         imgs = imgs.flatten().view(batch_size * num_sweeps * num_cams, num_channels, imH, imW)
         img_feats = self.img_neck(self.img_backbone(imgs))[0]
-        img_feats = img_feats.reshape(batch_size, num_sweeps, num_cams, img_feats.shape[1], img_feats.shape[2], img_feats.shape[3])
+        img_feats = img_feats.reshape(batch_size, num_sweeps, num_cams,
+                                      img_feats.shape[1], img_feats.shape[2], img_feats.shape[3])
         return img_feats
 
     def _forward_height_net(self, feat, mats_dict):
@@ -398,7 +438,10 @@ class LSSFPN(nn.Module):
 
     # 计算图像级的 bin-entropy：对 height 概率沿 D 维求熵，再做空间&相机平均
     @staticmethod
-    def _image_bin_entropy_from_height(height_prob: torch.Tensor, batch_size: int, num_cams: int, eps: float = 1e-8) -> torch.Tensor:
+    def _image_bin_entropy_from_height(height_prob: torch.Tensor,
+                                       batch_size: int,
+                                       num_cams: int,
+                                       eps: float = 1e-8) -> torch.Tensor:
         """
         height_prob: [B*num_cams, D, H', W'] (softmax 后)
         return: H_img [B]
@@ -415,12 +458,14 @@ class LSSFPN(nn.Module):
         sweep_imgs,
         mats_dict,
         is_return_height: bool = False,
-        return_bin_entropy: bool = False,  # <<< 新增：用于主动学习
+        return_bin_entropy: bool = False,
     ):
         """Forward function for single sweep."""
         batch_size, num_sweeps, num_cams, num_channels, img_height, img_width = sweep_imgs.shape
         img_feats = self.get_cam_feats(sweep_imgs)
-        source_features = img_feats[:, 0, ...]
+        source_features = img_feats[:, 0, ...]  # key-frame feats [B,N,C,Hf,Wf]
+
+        # HeightNet: [B*N, D+C_ctx, Hf, Wf]
         height_feature = self._forward_height_net(
             source_features.reshape(
                 batch_size * num_cams,
@@ -430,8 +475,9 @@ class LSSFPN(nn.Module):
             ),
             mats_dict,
         )
-        height = height_feature[:, :self.height_channels].softmax(1)
+        height = height_feature[:, :self.height_channels].softmax(1)  # [B*N, D, Hf, Wf]
         context = height_feature[:, self.height_channels:(self.height_channels + self.output_channels)]
+
         img_feat_with_height = height.unsqueeze(1) * context.unsqueeze(2)
         img_feat_with_height = self._forward_voxel_net(img_feat_with_height)
 
@@ -449,28 +495,29 @@ class LSSFPN(nn.Module):
             mats_dict['reference_heights'][:, sweep_index, ...],
             mats_dict.get('bda_mat', None),
         )
-        img_feat_with_height = img_feat_with_height.permute(0, 1, 3, 4, 5, 2)
+        img_feat_with_height = img_feat_with_height.permute(0, 1, 3, 4, 5, 2)  # [B,N,D,Hf,Wf,C]
         geom_xyz = ((geom_xyz - (self.voxel_coord - self.voxel_size / 2.0)) / self.voxel_size)
         geom_xyz_voxel = geom_xyz.int()
 
         if self.use_spread:
-            depth_weighted = depth * self.beta
+            # BEVSpread 扩散逻辑
+            depth_weighted = depth * self.beta  # [B,N,D,Hf,Wf]
 
             # 2x2 邻域
             geom_xyz_voxels = torch.repeat_interleave(geom_xyz_voxel.unsqueeze(-1), 4, dim=-1)
             geom_xyz_voxels[..., 0, :] += torch.tensor([0, 1, 0, 1], device=geom_xyz_voxels.device)
             geom_xyz_voxels[..., 1, :] += torch.tensor([0, 0, 1, 1], device=geom_xyz_voxels.device)
 
-            # 选择 top-k 最近 BEV 网格
             dxdy = torch.abs(geom_xyz_voxels - geom_xyz.unsqueeze(-1))
             dist_2 = dxdy[..., 0, :] ** 2 + dxdy[..., 1, :] ** 2
+
             topk, indices = torch.topk(dist_2, self.spread_nums, dim=-1, largest=False, sorted=True)
             indices = torch.repeat_interleave(indices.unsqueeze(-2), 3, dim=-2)
             geom_xyz_voxels = torch.gather(geom_xyz_voxels, dim=-1, index=indices)
 
-            # 权重衰减
             weight = torch.exp(-topk / depth_weighted)
             img_feat_with_heights = img_feat_with_height.unsqueeze(-1) * weight.unsqueeze(-2)
+
             img_feat_with_heights = img_feat_with_heights.permute(0, 1, 2, 6, 3, 4, 5).reshape(
                 batch_size, num_cams, -1,
                 img_feat_with_heights.shape[4], img_feat_with_heights.shape[5], img_feat_with_heights.shape[6]
@@ -500,7 +547,7 @@ class LSSFPN(nn.Module):
         mats_dict,
         timestamps=None,
         is_return_height: bool = False,
-        return_bin_entropy: bool = False,  # <<< 新增：主动学习时打开
+        return_bin_entropy: bool = False,
     ):
         """
         Return:
@@ -537,6 +584,7 @@ class LSSFPN(nn.Module):
             else:
                 return (key_frame_feature, H_img) if return_bin_entropy else key_frame_feature
 
+        # 其他 sweeps 只用于 BEV 特征累积，不算 AL signal
         ret_feature_list = [key_frame_feature]
         for sweep_index in range(1, num_sweeps):
             with torch.no_grad():
@@ -545,7 +593,7 @@ class LSSFPN(nn.Module):
                     sweep_imgs[:, sweep_index:sweep_index + 1, ...],
                     mats_dict,
                     is_return_height=False,
-                    return_bin_entropy=False,   # 只在 key-frame 计算 H_img
+                    return_bin_entropy=False,
                 )
                 ret_feature_list.append(feature_map)
 
