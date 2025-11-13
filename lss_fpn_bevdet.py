@@ -1,6 +1,6 @@
 # Copyright (c) Megvii Inc. All rights reserved.
 import numpy as np
-from vggt_c5_injector import VGGT_C5_Injector  # 保留以避免外部导入影响
+from vggt_c5_injector import VGGT_C5_Injector
 import torch
 import torch.nn.functional as F
 from mmcv.cnn import build_conv_layer
@@ -14,212 +14,366 @@ from ops.voxel_pooling import voxel_pooling
 __all__ = ['LSSFPN']
 
 
-# --------------------------
-# 简洁的 BEVDet 风格 DepthNet
-# --------------------------
-class DepthNet(nn.Module):
-    """
-    轻量深度+上下文双头（BEVDet 风格）：
-    输入: [B*N, C_in, Hf, Wf]
-    输出: cat([depth_logits: D, context_feats: C_ctx], dim=1)
-    """
-    def __init__(self, in_channels, mid_channels, context_channels, depth_channels):
-        super().__init__()
-        self.stem = nn.Sequential(
-            nn.Conv2d(in_channels, mid_channels, 3, padding=1, bias=False),
-            nn.BatchNorm2d(mid_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(mid_channels, mid_channels, 3, padding=1, bias=False),
-            nn.BatchNorm2d(mid_channels),
-            nn.ReLU(inplace=True),
-        )
-        # 深度分类头
-        self.depth_head = nn.Sequential(
-            nn.Conv2d(mid_channels, mid_channels, 3, padding=1, bias=False),
-            nn.BatchNorm2d(mid_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(mid_channels, depth_channels, 1, bias=True),
-        )
-        # 上下文特征头（送入体素融合）
-        self.context_head = nn.Sequential(
-            nn.Conv2d(mid_channels, mid_channels, 3, padding=1, bias=False),
-            nn.BatchNorm2d(mid_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(mid_channels, context_channels, 1, bias=True),
-        )
+class _ASPPModule(nn.Module):
+    def __init__(self, inplanes, planes, kernel_size, padding, dilation,
+                 BatchNorm):
+        super(_ASPPModule, self).__init__()
+        self.atrous_conv = nn.Conv2d(inplanes,
+                                     planes,
+                                     kernel_size=kernel_size,
+                                     stride=1,
+                                     padding=padding,
+                                     dilation=dilation,
+                                     bias=False)
+        self.bn = BatchNorm(planes)
+        self.relu = nn.ReLU()
 
-        # Kaiming 初始化
+        self._init_weight()
+
+    def forward(self, x):
+        x = self.atrous_conv(x)
+        x = self.bn(x)
+        return self.relu(x)
+
+    def _init_weight(self):
         for m in self.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, nonlinearity='relu')
+                torch.nn.init.kaiming_normal_(m.weight)
             elif isinstance(m, nn.BatchNorm2d):
-                m.weight.data.fill_(1.)
+                m.weight.data.fill_(1)
                 m.bias.data.zero_()
 
-    def forward(self, x, _mats_dict_ignored=None):
-        x = self.stem(x)
-        depth_logits = self.depth_head(x)      # [B*N, D, Hf, Wf]
-        context = self.context_head(x)         # [B*N, C_ctx, Hf, Wf]
-        return torch.cat([depth_logits, context], dim=1)
+
+class ASPP(nn.Module):
+    def __init__(self, inplanes, mid_channels=256, BatchNorm=nn.BatchNorm2d):
+        super(ASPP, self).__init__()
+
+        dilations = [1, 6, 12, 18]
+
+        self.aspp1 = _ASPPModule(inplanes,
+                                 mid_channels,
+                                 1,
+                                 padding=0,
+                                 dilation=dilations[0],
+                                 BatchNorm=BatchNorm)
+        self.aspp2 = _ASPPModule(inplanes,
+                                 mid_channels,
+                                 3,
+                                 padding=dilations[1],
+                                 dilation=dilations[1],
+                                 BatchNorm=BatchNorm)
+        self.aspp3 = _ASPPModule(inplanes,
+                                 mid_channels,
+                                 3,
+                                 padding=dilations[2],
+                                 dilation=dilations[2],
+                                 BatchNorm=BatchNorm)
+        self.aspp4 = _ASPPModule(inplanes,
+                                 mid_channels,
+                                 3,
+                                 padding=dilations[3],
+                                 dilation=dilations[3],
+                                 BatchNorm=BatchNorm)
+
+        self.global_avg_pool = nn.Sequential(
+            nn.AdaptiveAvgPool2d((1, 1)),
+            nn.Conv2d(inplanes, mid_channels, 1, stride=1, bias=False),
+            BatchNorm(mid_channels),
+            nn.ReLU(),
+        )
+        self.conv1 = nn.Conv2d(int(mid_channels * 5),
+                               mid_channels,
+                               1,
+                               bias=False)
+        self.bn1 = BatchNorm(mid_channels)
+        self.relu = nn.ReLU()
+        self.dropout = nn.Dropout(0.5)
+        self._init_weight()
+
+    def forward(self, x):
+        x1 = self.aspp1(x)
+        x2 = self.aspp2(x)
+        x3 = self.aspp3(x)
+        x4 = self.aspp4(x)
+        x5 = self.global_avg_pool(x)
+        x5 = F.interpolate(x5,
+                           size=x4.size()[2:],
+                           mode='bilinear',
+                           align_corners=True)
+        x = torch.cat((x1, x2, x3, x4, x5), dim=1)
+
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+
+        return self.dropout(x)
+
+    def _init_weight(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                torch.nn.init.kaiming_normal_(m.weight)
+            elif isinstance(m, nn.BatchNorm2d):
+                m.weight.data.fill_(1)
+                m.bias.data.zero_()
+
+
+class Mlp(nn.Module):
+    def __init__(self,
+                 in_features,
+                 hidden_features=None,
+                 out_features=None,
+                 act_layer=nn.ReLU,
+                 drop=0.0):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.drop1 = nn.Dropout(drop)
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop2 = nn.Dropout(drop)
+
+    def forward(self, x):
+        x = self.fc1(x)
+        x = self.act(x)
+        x = self.drop1(x)
+        x = self.fc2(x)
+        x = self.drop2(x)
+        return x
+
+
+class SELayer(nn.Module):
+    def __init__(self, channels, act_layer=nn.ReLU, gate_layer=nn.Sigmoid):
+        super().__init__()
+        self.conv_reduce = nn.Conv2d(channels, channels, 1, bias=True)
+        self.act1 = act_layer()
+        self.conv_expand = nn.Conv2d(channels, channels, 1, bias=True)
+        self.gate = gate_layer()
+
+    def forward(self, x, x_se):
+        x_se = self.conv_reduce(x_se)
+        x_se = self.act1(x_se)
+        x_se = self.conv_expand(x_se)
+        return x * self.gate(x_se)
+
+
+# --------- 新的 LSS 风格 DepthNet（替代原 HeightNet，仅结构变化，接口保持不变）---------
+class DepthNet(nn.Module):
+    """
+    LSS-style depth + context head:
+      - 输入: image feature map
+      - 输出: [B, D + C, H, W]，前 D 个通道为 depth logits，后 C 个通道为 context 特征
+
+    与原 HeightNet 不同的是：
+      * 不再用 camera-aware MLP / SELayer / ASPP
+      * 仅使用 Conv-BN-ReLU 堆叠，尽量贴近 Lift, Splat, Shoot 的 DepthNet 形式
+    """
+
+    def __init__(self, in_channels, mid_channels, depth_channels, context_channels):
+        super().__init__()
+        self.depth_channels = depth_channels
+        self.context_channels = context_channels
+
+        self.conv1 = nn.Conv2d(in_channels, mid_channels, kernel_size=3, padding=1, bias=False)
+        self.bn1 = nn.BatchNorm2d(mid_channels)
+
+        self.conv2 = nn.Conv2d(mid_channels, mid_channels, kernel_size=3, padding=1, bias=False)
+        self.bn2 = nn.BatchNorm2d(mid_channels)
+
+        # 输出 D + C 个通道：前 D 为 depth logits，后 C 为 BEV context 特征
+        self.conv_out = nn.Conv2d(mid_channels,
+                                  depth_channels + context_channels,
+                                  kernel_size=1,
+                                  padding=0,
+                                  bias=True)
+
+        self.relu = nn.ReLU(inplace=True)
+
+    def forward(self, x, mats_dict=None):
+        """
+        输入:
+            x: [B, C_in, H, W]
+            mats_dict: 为了接口兼容保留，但在 LSS 风格 DepthNet 中不使用
+        输出:
+            feat: [B, D + C, H, W]
+        """
+        x = self.conv1(x)
+        x = self.bn1(x)
+        x = self.relu(x)
+
+        x = self.conv2(x)
+        x = self.bn2(x)
+        x = self.relu(x)
+
+        x = self.conv_out(x)
+        return x
 
 
 class LSSFPN(nn.Module):
     def __init__(self, x_bound, y_bound, z_bound, d_bound, final_dim,
                  downsample_factor, output_channels, img_backbone_conf,
                  img_neck_conf, height_net_conf):
-        """Modified towards BEVDet-style LSS view transformer.
+        """Modified from `https://github.com/nv-tlabs/lift-splat-shoot`.
 
         Args:
-            x_bound (list): [x_min, x_max, x_step]
-            y_bound (list): [y_min, y_max, y_step]
-            z_bound (list): [z_min, z_max, z_step]
-            d_bound (list): [d_min, d_max, num_bins]  # 注意第三项为bins数
-            final_dim (list): 输入图像尺寸 [H, W]
-            downsample_factor (int): 下采样率(输入图到特征图)
-            output_channels (int): 体素融合前通道数 (context_channels)
-            img_backbone_conf (dict): 图像backbone配置
-            img_neck_conf (dict): FPN/neck配置
-            height_net_conf (dict): 这里仍沿用名字，但会用于DepthNet
+            x_bound (list): Boundaries for x.
+            y_bound (list): Boundaries for y.
+            z_bound (list): Boundaries for z.
+            d_bound (list): Boundaries for d.
+            final_dim (list): Dimension for input images.
+            downsample_factor (int): Downsample factor between feature map
+                and input image.
+            output_channels (int): Number of channels for the output
+                feature map.
+            img_backbone_conf (dict): Config for image backbone.
+            img_neck_conf (dict): Config for image neck.
+            height_net_conf (dict): Config for depth/height net.
         """
+
         super(LSSFPN, self).__init__()
         self.downsample_factor = downsample_factor
         self.d_bound = d_bound
         self.final_dim = final_dim
         self.output_channels = output_channels
 
-        # 体素网格参数
+        # voxel grid
         self.register_buffer(
             'voxel_size',
             torch.Tensor([row[2] for row in [x_bound, y_bound, z_bound]]))
         self.register_buffer(
             'voxel_coord',
-            torch.Tensor([row[0] + row[2] / 2.0 for row in [x_bound, y_bound, z_bound]]))
+            torch.Tensor([
+                row[0] + row[2] / 2.0 for row in [x_bound, y_bound, z_bound]
+            ]))
         self.register_buffer(
             'voxel_num',
-            torch.LongTensor([(row[1] - row[0]) / row[2] for row in [x_bound, y_bound, z_bound]]))
+            torch.LongTensor([(row[1] - row[0]) / row[2]
+                              for row in [x_bound, y_bound, z_bound]]))
 
-        # 视锥体 (线性深度采样，BEVDet 风格)
+        # LSS-style frustum (均匀深度)
         self.register_buffer('frustum', self.create_frustum())
-        self.height_channels, _, _, _ = self.frustum.shape  # D
+        self.height_channels, _, _, _ = self.frustum.shape  # 这里的 "height_channels" 实际上就是 depth_bins D
 
-        # 图像主干与颈部
         self.img_backbone = build_backbone(img_backbone_conf)
         self.img_neck = build_neck(img_neck_conf)
-
-        # 用 DepthNet 取代原 HeightNet（仍复用 height_net_conf 字段）
         self.height_net = self._configure_height_net(height_net_conf)
 
         self.img_neck.init_weights()
         self.img_backbone.init_weights()
 
     def _configure_height_net(self, height_net_conf):
-        # 将原 HeightNet 的 in/mid 配置沿用给 DepthNet
+        # 使用新的 DepthNet，保持接口: forward(feat, mats_dict) -> [B, D+C, H, W]
         return DepthNet(
-            height_net_conf['in_channels'],
-            height_net_conf['mid_channels'],
-            self.output_channels,
-            self.height_channels,  # depth bins
+            in_channels=height_net_conf['in_channels'],
+            mid_channels=height_net_conf['mid_channels'],
+            depth_channels=self.height_channels,
+            context_channels=self.output_channels,
         )
 
-    # --------------------------
-    # BEVDet 风格的视锥体构建
-    # --------------------------
     def create_frustum(self):
-        """Generate frustum: [D, fH, fW, 4] with (u, v, d, 1)."""
+        """Generate frustum (LSS-style: uniform metric depth bins)."""
+        # image plane grid
         ogfH, ogfW = self.final_dim
         fH, fW = ogfH // self.downsample_factor, ogfW // self.downsample_factor
 
-        # 线性深度划分（BEVDet 常用）
-        D = int(self.d_bound[2])
-        d_min, d_max = float(self.d_bound[0]), float(self.d_bound[1])
-        d_coords = torch.linspace(d_min, d_max, D, dtype=torch.float32).view(-1, 1, 1).expand(-1, fH, fW)
+        # depth bins: [d_min, d_max], num_bins = d_bound[2]
+        d_min, d_max, d_num = self.d_bound
+        d_num = int(d_num)
 
-        x_coords = torch.linspace(0, ogfW - 1, fW, dtype=torch.float32).view(1, 1, fW).expand(D, fH, fW)
-        y_coords = torch.linspace(0, ogfH - 1, fH, dtype=torch.float32).view(1, fH, 1).expand(D, fH, fW)
+        # 均匀深度采样：与 LSS 一致使用 metric depth 等间距
+        depth_values = torch.linspace(d_min, d_max, d_num, dtype=torch.float32)
+        d_coords = depth_values.view(-1, 1, 1).expand(-1, fH, fW)  # [D, fH, fW]
+
+        D, _, _ = d_coords.shape
+
+        # 像素坐标网格
+        x_coords = torch.linspace(0, ogfW - 1, fW, dtype=torch.float32).view(
+            1, 1, fW).expand(D, fH, fW)
+        y_coords = torch.linspace(0, ogfH - 1, fH,
+                                  dtype=torch.float32).view(1, fH,
+                                                            1).expand(D, fH, fW)
         paddings = torch.ones_like(d_coords)
 
-        # D x H x W x 4  (u, v, d, 1)
-        frustum = torch.stack((x_coords, y_coords, d_coords, paddings), dim=-1)
+        # D x H x W x 4 (u, v, depth, 1)
+        frustum = torch.stack((x_coords, y_coords, d_coords, paddings), -1)
         return frustum
 
-    # --------------------------
-    # BEVDet/LSS 几何（不依赖高度平面）
-    # --------------------------
-    @torch.no_grad()
+    def height2localtion(self, points, sensor2ego_mat, sensor2virtual_mat, intrin_mat, reference_heights):
+        # 保持原 BEVHeight 几何逻辑不变，以确保仅靠本文件就能跑通
+        batch_size, num_cams, _, _ = sensor2ego_mat.shape
+        reference_heights = reference_heights.view(batch_size, num_cams, 1, 1, 1, 1,
+                                                   1).repeat(1, 1, points.shape[2], points.shape[3], points.shape[4], 1,
+                                                             1)
+        height = -1 * points[:, :, :, :, :, 2, :] + reference_heights[:, :, :, :, :, 0, :]
+
+        points_const = points.clone()
+        points_const[:, :, :, :, :, 2, :] = 10
+        points_const = torch.cat(
+            (points_const[:, :, :, :, :, :2] * points_const[:, :, :, :, :, 2:3],
+             points_const[:, :, :, :, :, 2:]), 5)
+        combine_virtual = sensor2virtual_mat.matmul(torch.inverse(intrin_mat))
+        points_virtual = combine_virtual.view(batch_size, num_cams, 1, 1, 1, 4, 4).matmul(points_const)
+        ratio = height[:, :, :, :, :, 0] / points_virtual[:, :, :, :, :, 1, 0]
+        ratio = ratio.view(batch_size, num_cams, ratio.shape[2], ratio.shape[3], ratio.shape[4], 1, 1).repeat(1, 1, 1,
+                                                                                                              1, 1, 4,
+                                                                                                              1)
+        points = points_virtual * ratio
+        points[:, :, :, :, :, 3, :] = 1
+        combine_ego = sensor2ego_mat.matmul(torch.inverse(sensor2virtual_mat))
+        points = combine_ego.view(batch_size, num_cams, 1, 1, 1, 4,
+                                  4).matmul(points)
+        return points
+
     def get_geometry(self, sensor2ego_mat, sensor2virtual_mat, intrin_mat, ida_mat, reference_heights, bda_mat):
+        """Transfer points from camera coord to ego coord.
+
+        Args:
+            sensor2ego_mat(Tensor): (B, num_cams, 4, 4).
+            intrin_mat(Tensor): (B, num_cams, 4, 4).
+            ida_mat(Tensor): (B, num_cams, 4, 4).
+            bda_mat(Tensor or None): (B, 4, 4).
+
+        Returns:
+            Tensors: points in ego coord, shape (B, num_cams, D, fH, fW, 3).
         """
-        将像素+深度投影到ego系的3D点：
-            uv1 --IDA^-1--> uv1(pre) --K^-1--> ray_cam --*d--> p_cam --T_cam2ego--> p_ego --(BDA)--> p_ego'
-        NOTE: 保留形参以兼容外部调用，但不再使用 sensor2virtual_mat/reference_heights。
-        返回: [B, N, D, fH, fW, 3]
-        """
-        device = intrin_mat.device
-        dtype = intrin_mat.dtype
+        batch_size, num_cams, _, _ = sensor2ego_mat.shape
 
-        B, N, _, _ = sensor2ego_mat.shape
-        D, fH, fW, _ = self.frustum.shape
+        # undo ida
+        points = self.frustum  # [D, fH, fW, 4]
+        ida_mat = ida_mat.view(batch_size, num_cams, 1, 1, 1, 4, 4)
+        points = ida_mat.inverse().matmul(points.unsqueeze(-1))
 
-        # 准备 uv1 与 d
-        frustum = self.frustum.to(device=device, dtype=dtype)
-        # uv1: [D, H, W, 3]
-        uv1 = torch.stack(
-            [frustum[..., 0], frustum[..., 1], torch.ones_like(frustum[..., 0])],
-            dim=-1
-        )
+        # 使用原始 BEVHeight 的 height2localtion 几何变换
+        points = self.height2localtion(points, sensor2ego_mat, sensor2virtual_mat, intrin_mat, reference_heights)
 
-        # reshape & broadcast: [B, N, D, H, W, 3, 1]
-        uv1 = uv1.view(1, 1, D, fH, fW, 3, 1).repeat(B, N, 1, 1, 1, 1, 1)
-        d = frustum[..., 2].view(1, 1, D, fH, fW, 1, 1)
-
-        # IDA^-1 (3x3 + 平移)，将增强后的像素坐标还原
-        ida_inv = torch.inverse(ida_mat)  # [B, N, 4, 4]
-        R_ida = ida_inv[..., :3, :3].view(B, N, 1, 1, 1, 3, 3)
-        t_ida = ida_inv[..., :3, 3].view(B, N, 1, 1, 1, 3, 1)
-        uv1_pre = R_ida @ uv1 + t_ida  # [B, N, D, H, W, 3, 1]
-
-        # K^-1
-        K_inv = torch.inverse(intrin_mat[..., :3, :3]).view(B, N, 1, 1, 1, 3, 3)
-        rays_cam = K_inv @ uv1_pre  # [B, N, D, H, W, 3, 1]
-
-        # 乘深度得到相机坐标点
-        points_cam = rays_cam * d.to(dtype=dtype, device=device)  # [..., 3, 1]
-        ones = torch.ones_like(points_cam[..., :1, :])
-        points_cam_4 = torch.cat([points_cam, ones], dim=-2)  # [..., 4, 1]
-
-        # 相机到自车
-        T = sensor2ego_mat.view(B, N, 1, 1, 1, 4, 4)
-        points_ego = T @ points_cam_4  # [..., 4, 1]
-
-        # BDA（可选）
         if bda_mat is not None:
-            BDA = bda_mat.view(B, 1, 1, 1, 1, 4, 4)
-            points_ego = BDA @ points_ego
+            bda_mat = bda_mat.unsqueeze(1).repeat(1, num_cams, 1, 1).view(
+                batch_size, num_cams, 1, 1, 1, 4, 4)
+            points = (bda_mat @ points).squeeze(-1)
+        else:
+            points = points.squeeze(-1)
+        return points[..., :3]
 
-        points_ego = points_ego.squeeze(-1)[..., :3]  # [B, N, D, H, W, 3]
-        return points_ego
-
-    # --------------------------
-    # 常规图像特征
-    # --------------------------
     def get_cam_feats(self, imgs):
         """Get feature maps from images."""
-        B, S, N, C, H, W = imgs.shape
-        imgs = imgs.flatten().view(B * S * N, C, H, W)
+        batch_size, num_sweeps, num_cams, num_channels, imH, imW = imgs.shape
+
+        imgs = imgs.flatten().view(batch_size * num_sweeps * num_cams,
+                                   num_channels, imH, imW)
         img_feats = self.img_neck(self.img_backbone(imgs))[0]
-        img_feats = img_feats.reshape(B, S, N, img_feats.shape[1], img_feats.shape[2], img_feats.shape[3])
+        img_feats = img_feats.reshape(batch_size, num_sweeps, num_cams,
+                                      img_feats.shape[1], img_feats.shape[2],
+                                      img_feats.shape[3])
         return img_feats
 
     def _forward_height_net(self, feat, mats_dict):
-        # 兼容原接口；内部已改为 BEVDet-style DepthNet
+        # 这里的 height_net 已经是 LSS 风格 DepthNet，但保持相同调用方式
         return self.height_net(feat, mats_dict)
 
-    def _forward_voxel_net(self, img_feat_with_depth):
-        # 与 BEVDet 一致：直接体素池化前的特征，不做额外处理
-        return img_feat_with_depth
+    def _forward_voxel_net(self, img_feat_with_height):
+        # 这里保持为 identity，方便以后在 BEV 空间上再接 neck / head
+        return img_feat_with_height
 
-    # --------------------------
-    # 单帧（key-frame）前向
-    # --------------------------
     def _forward_single_sweep(self,
                               sweep_index,
                               sweep_imgs,
@@ -227,108 +381,132 @@ class LSSFPN(nn.Module):
                               is_return_height=False,
                               return_bin_entropy: bool = False,
                               return_depth_profile=False, depth_profile_mode="hard",
-                              depth_profile_weight="none"):
-        """
-        BEVDet 风格：深度分布 * 上下文特征 -> 体素池化
-        仍保留 AL 的可选返回，便于兼容，但实现不再依赖任何 AL 模块。
-        """
-        B, S, N, C, H, W = sweep_imgs.shape
+                              depth_profile_weight="none"
+                              ):
+        """Forward function for single sweep.
 
-        # 1) 图像特征
-        img_feats = self.get_cam_feats(sweep_imgs)            # [B,S,N,Cf,Hf,Wf]
-        source_features = img_feats[:, 0, ...]                # [B,N,Cf,Hf,Wf]
+        Args:
+            sweep_index (int): Index of sweeps.
+            sweep_imgs (Tensor): Input images.
+            mats_dict (dict): camera & augmentation matrices.
+            is_return_height (bool, optional): Whether to return depth/height volume.
 
-        # 2) 深度+上下文（BEVDet 风格）
-        depth_context = self._forward_height_net(
-            source_features.reshape(B * N, source_features.shape[2], source_features.shape[3], source_features.shape[4]),
+        Returns:
+            Tensor or tuple: BEV feature map (+ 可选的 height, H_img, m_depth_img).
+        """
+        batch_size, num_sweeps, num_cams, num_channels, img_height, \
+        img_width = sweep_imgs.shape
+        img_feats = self.get_cam_feats(sweep_imgs)
+        source_features = img_feats[:, 0, ...]  # [B, num_cams, C, fH, fW]
+
+        # -------- LSS 风格 depth + context 预测 --------
+        height_feature = self._forward_height_net(
+            source_features.reshape(batch_size * num_cams,
+                                    source_features.shape[2],
+                                    source_features.shape[3],
+                                    source_features.shape[4]),
             mats_dict,
-        )                                                     # [B*N, D+C_ctx, Hf, Wf]
-        D = self.height_channels
-        depth_logits = depth_context[:, :D]                   # [B*N, D, Hf, Wf]
-        context = depth_context[:, D:(D + self.output_channels)]  # [B*N, C_ctx, Hf, Wf]
-        depth_prob = depth_logits.softmax(dim=1)              # 概率化
+        )  # [B*num_cams, D+C, fH, fW]
 
-        # 可选: 信息熵/深度profile（兼容外部接口需求）
+        height = height_feature[:, :self.height_channels].softmax(1)  # [B*num_cams, D, fH, fW]
+
+        # ---- 计算 H_img（与现在相同）----
         if return_bin_entropy:
             eps = 1e-12
-            H_map = -(depth_prob * (depth_prob.clamp_min(eps).log())).sum(dim=1) / float(np.log(D))
-            H_cam = H_map.mean(dim=(1, 2))                    # [B*N]
-            H_img = H_cam.view(B, N).mean(dim=1)              # [B]
+            D = height.shape[1]
+            H_map = -(height * (height.clamp_min(eps).log())).sum(dim=1) / float(np.log(D))  # [B*num_cams, fH, fW]
+            H_cam = H_map.mean(dim=(1, 2))  # [B*num_cams]
+            B = sweep_imgs.shape[0]
+            num_cams = sweep_imgs.shape[2]
+            H_img = H_cam.view(B, num_cams).mean(dim=1)  # [B]
         else:
             H_img = None
 
+        # ---- 计算 m_depth_img: [B, D] ----
         if return_depth_profile:
-            _, D, fH, fW = depth_prob.shape
+            B = sweep_imgs.shape[0]
+            num_cams = sweep_imgs.shape[2]
+            _, D, fH, fW = height.shape
+
             if depth_profile_mode == "hard":
-                top1_prob, top1_idx = depth_prob.max(dim=1)   # [B*N, Hf, Wf]
+                top1_prob, top1_idx = height.max(dim=1)  # [B*num_cams, fH, fW]
                 if depth_profile_weight == "top1":
-                    w = top1_prob.reshape(B * N, -1)
+                    w = top1_prob.reshape(B * num_cams, -1)  # [B*num_cams, fH*fW]
                 elif depth_profile_weight == "margin":
-                    top2_prob = depth_prob.topk(k=2, dim=1).values[:, 1, :, :]
-                    w = (top1_prob - top2_prob).clamp_min(0).reshape(B * N, -1)
+                    top2_prob = height.topk(k=2, dim=1).values[:, 1, :, :]  # [B*num_cams, fH, fW]
+                    w = (top1_prob - top2_prob).clamp_min(0).reshape(B * num_cams, -1)
                 else:
-                    w = torch.ones(B * N, fH * fW, device=depth_prob.device, dtype=depth_prob.dtype)
-                idx_flat = top1_idx.reshape(B * N, -1)
-                m_flat = torch.zeros(B * N, D, device=depth_prob.device, dtype=depth_prob.dtype)
-                m_flat.scatter_add_(1, idx_flat, w)
-                m_img = m_flat.view(B, N, D).sum(dim=1)       # [B, D]
+                    w = torch.ones(B * num_cams, fH * fW, device=height.device, dtype=height.dtype)
+
+                idx_flat = top1_idx.reshape(B * num_cams, -1)  # [L, Npix]
+                m_flat = torch.zeros(B * num_cams, D, device=height.device, dtype=height.dtype)
+                m_flat.scatter_add_(1, idx_flat, w)  # 按 top-1 累加权重
+                m_img = m_flat.view(B, num_cams, D).sum(dim=1)  # 相机上求和 -> [B, D]
             else:
-                m_cam = depth_prob.mean(dim=(2, 3))           # [B*N, D]
-                m_img = m_cam.view(B, N, D).mean(dim=1)       # [B, D]
-            m_depth_img = m_img / (m_img.sum(dim=1, keepdim=True).clamp_min(1e-6))
+                # soft-mode：空间平均概率
+                m_cam = height.mean(dim=(2, 3))  # [B*num_cams, D]
+                m_img = m_cam.view(B, num_cams, D).mean(dim=1)  # [B, D]
+
+            m_depth_img = m_img / (m_img.sum(dim=1, keepdim=True).clamp_min(1e-6))  # L1 归一
         else:
             m_depth_img = None
 
-        # 3) 外积融合 (B*N, C_ctx, D, Hf, Wf)
-        img_feat_with_depth = depth_prob.unsqueeze(1) * context.unsqueeze(2)
-        img_feat_with_depth = self._forward_voxel_net(img_feat_with_depth)
+        # -------- Lift: depth × context -> 3D features --------
+        img_feat_with_height = height.unsqueeze(
+            1) * height_feature[:, self.height_channels:(
+                self.height_channels + self.output_channels)].unsqueeze(2)
+        img_feat_with_height = self._forward_voxel_net(img_feat_with_height)
 
-        # 4) 几何 (BEVDet/LSS)
-        img_feat_with_depth = img_feat_with_depth.reshape(B, N,
-                                                          img_feat_with_depth.shape[1],
-                                                          img_feat_with_depth.shape[2],
-                                                          img_feat_with_depth.shape[3],
-                                                          img_feat_with_depth.shape[4])  # [B,N,C,D,Hf,Wf]
+        img_feat_with_height = img_feat_with_height.reshape(
+            batch_size,
+            num_cams,
+            img_feat_with_height.shape[1],
+            img_feat_with_height.shape[2],
+            img_feat_with_height.shape[3],
+            img_feat_with_height.shape[4],
+        )
 
         geom_xyz = self.get_geometry(
             mats_dict['sensor2ego_mats'][:, sweep_index, ...],
-            mats_dict.get('sensor2virtual_mats', None),  # 兼容键，内部不会使用
+            mats_dict['sensor2virtual_mats'][:, sweep_index, ...],
             mats_dict['intrin_mats'][:, sweep_index, ...],
             mats_dict['ida_mats'][:, sweep_index, ...],
-            mats_dict.get('reference_heights', None),
+            mats_dict['reference_heights'][:, sweep_index, ...],
             mats_dict.get('bda_mat', None),
-        )                                                     # [B,N,D,Hf,Wf,3]
+        )
+        img_feat_with_height = img_feat_with_height.permute(0, 1, 3, 4, 5, 2)
+        geom_xyz = ((geom_xyz - (self.voxel_coord - self.voxel_size / 2.0)) /
+                    self.voxel_size).int()
 
-        # 5) 体素池化到 BEV
-        feats_for_pool = img_feat_with_depth.permute(0, 1, 3, 4, 5, 2).contiguous()  # [B,N,D,Hf,Wf,C]
-        # 量化到体素索引
-        geom_xyz = ((geom_xyz - (self.voxel_coord - self.voxel_size / 2.0)) / self.voxel_size).int()
-        feature_map = voxel_pooling(geom_xyz, feats_for_pool, self.voxel_num.to(geom_xyz.device))
+        feature_map = voxel_pooling(geom_xyz, img_feat_with_height.contiguous(),
+                                    self.voxel_num.cuda())
 
-        # 6) 兼容不同返回模式
+        # -------- 输出保持与你之前一致，方便 active learning 调用 --------
         if return_bin_entropy and return_depth_profile:
             return feature_map.contiguous(), H_img, m_depth_img
         if is_return_height and return_bin_entropy:
-            return feature_map.contiguous(), depth_prob, H_img
+            return (feature_map.contiguous(), height, H_img)
         if is_return_height:
-            return feature_map.contiguous(), depth_prob
+            return feature_map.contiguous(), height
         if return_bin_entropy:
             return feature_map.contiguous(), H_img
         return feature_map.contiguous()
 
-    def forward(self,
-                sweep_imgs,
-                mats_dict,
-                timestamps=None,
-                is_return_height: bool = False,
-                return_bin_entropy: bool = False,
-                return_depth_profile: bool = False,
-                depth_profile_mode: str = "hard",
-                depth_profile_weight: str = "none"):
-        # 只用 key-frame（index 0），与原逻辑一致
+    def forward(
+            self,
+            sweep_imgs,
+            mats_dict,
+            timestamps=None,
+            is_return_height: bool = False,
+            return_bin_entropy: bool = False,
+            return_depth_profile: bool = False,
+            depth_profile_mode: str = "hard",
+            depth_profile_weight: str = "none",
+    ):
+        # 只跑 key-frame（index 0）
         out = self._forward_single_sweep(
             0,
-            sweep_imgs[:, 0:1, ...],  # (B,1,N,C,H,W)
+            sweep_imgs[:, 0:1, ...],  # (B,1,num_cams,C,H,W)
             mats_dict,
             is_return_height=is_return_height,
             return_bin_entropy=return_bin_entropy,
@@ -336,4 +514,5 @@ class LSSFPN(nn.Module):
             depth_profile_mode=depth_profile_mode,
             depth_profile_weight=depth_profile_weight,
         )
+        # 直接透传 _forward_single_sweep 的返回
         return out
